@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"sort"
@@ -114,14 +115,23 @@ type Store struct {
 
 	dirty      atomic.Bool
 	flushEvery time.Duration
-	startOnce  sync.Once
-	stopOnce   sync.Once
-	stopCh     chan struct{}
-	doneCh     chan struct{}
+	// lastSaveErr 上一次落盘失败的文案（仅由刷盘 goroutine/Stop 在持锁外写读，
+	// 用于同一条错误只记一次日志）。
+	lastSaveErr string
+	startOnce   sync.Once
+	stopOnce    sync.Once
+	stopCh      chan struct{}
+	doneCh      chan struct{}
 }
 
 // New 构建存储并从 path 读取已有密钥（文件不存在 = 空表，不是错误）。
+//
+// path 会解析为绝对路径：写盘失败时的错误信息要能直接定位文件，相对路径在
+// 容器/后台启动（cwd 与预期不同）下无从排查。
 func New(path string) (*Store, error) {
+	if abs, err := filepath.Abs(path); err == nil {
+		path = abs
+	}
 	s := &Store{
 		path:       path,
 		now:        time.Now,
@@ -214,6 +224,7 @@ func (s *Store) Create(in CreateInput) (View, string, error) {
 	list := append(append([]*Key{}, cur.list...), k)
 	s.snap.Store(&Snapshot{byHash: byHash, list: list})
 	if err := s.saveLocked(); err != nil {
+		s.snap.Store(cur) // 回滚：落盘失败时内存必须与磁盘一致（否则报错了密钥却能用，重启又消失）
 		return View{}, "", err
 	}
 	return k.view(), plain, nil
@@ -290,6 +301,7 @@ func (s *Store) Update(id string, in UpdateInput) (View, error) {
 	}
 	s.replaceLocked(old, &next)
 	if err := s.saveLocked(); err != nil {
+		s.snap.Store(cur) // 回滚（同 Create）
 		return View{}, err
 	}
 	return next.view(), nil
@@ -313,6 +325,7 @@ func (s *Store) Rotate(id string) (View, string, error) {
 	next.Prefix = plain[:11] + "…"
 	s.replaceLocked(old, &next)
 	if err := s.saveLocked(); err != nil {
+		s.snap.Store(cur) // 回滚（同 Create）
 		return View{}, "", err
 	}
 	return next.view(), plain, nil
@@ -340,8 +353,13 @@ func (s *Store) Remove(id string) error {
 		}
 		list = append(list, v)
 	}
+	prev := cur
 	s.snap.Store(&Snapshot{byHash: byHash, list: list})
-	return s.saveLocked()
+	if err := s.saveLocked(); err != nil {
+		s.snap.Store(prev) // 回滚（同 Create）
+		return err
+	}
+	return nil
 }
 
 // findLocked 按 ID 在快照里查（密钥数量有界，线性扫描足够且省一层索引维护）。
@@ -428,7 +446,11 @@ func (s *Store) load() error {
 	return nil
 }
 
-// saveLocked 原子落盘（tmp + rename，权限 0600）；调用方必须已持 s.mu。
+// saveLocked 原子落盘（唯一临时名 + rename，权限 0600）；调用方必须已持 s.mu。
+//
+// 为什么临时名唯一（而不是固定的 keys.json.tmp）：固定名会被上一次异常退出遗留的
+// 文件（可能是别的 uid 创建、0600/0444）卡死 —— 表现为此后每次写入都 permission denied，
+// 而目录本身是可写的。CreateTemp 生成唯一名，从根上消除这种"卡死"形态。
 func (s *Store) saveLocked() error {
 	snap := s.snap.Load()
 	f := file{Version: fileVersion, Keys: snap.list}
@@ -436,18 +458,63 @@ func (s *Store) saveLocked() error {
 	if err != nil {
 		return fmt.Errorf("keystore: marshal: %w", err)
 	}
+	dir := filepath.Dir(s.path)
 	if err := ensureDir(s.path); err != nil {
-		return fmt.Errorf("keystore: mkdir: %w", err)
+		return fmt.Errorf("keystore: 无法创建目录 %s: %w%s", dir, err, dirHint(dir))
 	}
-	tmp := s.path + ".tmp"
-	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
-		return fmt.Errorf("keystore: write tmp: %w", err)
+	tmpf, err := os.CreateTemp(dir, filepath.Base(s.path)+".*.tmp")
+	if err != nil {
+		return fmt.Errorf("keystore: 无法写入 %s（无法创建临时文件）: %s%s", s.path, errReason(err), dirHint(dir))
+	}
+	tmp := tmpf.Name()
+	if _, err := tmpf.Write(raw); err != nil {
+		tmpf.Close()
+		_ = os.Remove(tmp)
+		return fmt.Errorf("keystore: 无法写入 %s（临时文件写入失败）: %s%s", s.path, errReason(err), dirHint(dir))
+	}
+	if err := tmpf.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("keystore: 无法写入 %s（临时文件关闭失败）: %s%s", s.path, errReason(err), dirHint(dir))
 	}
 	if err := os.Rename(tmp, s.path); err != nil {
-		return fmt.Errorf("keystore: rename: %w", err)
+		_ = os.Remove(tmp)
+		return fmt.Errorf("keystore: 替换 %s 失败: %s%s", s.path, errReason(err), dirHint(dir))
 	}
 	s.dirty.Store(false)
 	return nil
+}
+
+// errReason 提取错误的底层原因（errno 文案），剥掉 os.CreateTemp 生成的随机文件名。
+//
+// 为什么必须剥掉：刷盘是周期性的，同一条错误要靠**文案稳定**来去重；只要文案里
+// 含随机临时文件名，每次都会判成"新错误"，日志被同一条故障刷屏。
+func errReason(err error) string {
+	var perr *os.PathError
+	if errors.As(err, &perr) {
+		return perr.Err.Error()
+	}
+	return err.Error()
+}
+
+// dirHint 在落盘失败时补充可执行的排查信息：目录当前是否真的不可写、进程身份、
+// 以及容器部署下最常见的两种处置方式。写盘失败在远端（docker 挂载目录属主与容器
+// 用户不一致）几乎总是同一类原因，光靠 "permission denied" 无法定位到该改什么。
+func dirHint(dir string) string {
+	writable := "否"
+	if f, err := os.CreateTemp(dir, ".wb2a-write-probe-*"); err == nil {
+		writable = "是（说明不是目录权限问题，可能是同名的遗留只读临时文件）"
+		_ = f.Close()
+		_ = os.Remove(f.Name())
+	} else {
+		writable = "否（" + errReason(err) + "）"
+	}
+	idPart := ""
+	if uid, gid, ok := processIDs(); ok {
+		idPart = fmt.Sprintf("；进程 uid=%d gid=%d", uid, gid)
+	}
+	return fmt.Sprintf("（目录 %s 可写：%s%s。docker compose 部署通常是宿主机目录属主与容器用户不一致："+
+		"sudo chown -R 10001:10001 ./data，或 PUID=$(id -u) PGID=$(id -g) docker compose up -d）",
+		dir, writable, idPart)
 }
 
 // NoteUsage 累计一次上游尝试的用量（与 internal/usage 同口径：重试与失败都计）。
@@ -478,6 +545,22 @@ func (s *Store) Save() error {
 	return s.saveLocked()
 }
 
+// saveAndLog 供防抖刷盘与 Stop 使用：失败必须落日志。
+// 此前是 `_ = s.Save()` 静默吞掉 —— 部署里目录不可写时，密钥用量等统计会一直丢，
+// 而日志里一句提示都没有（用户只能从面板操作报错才发现）。
+// 同一条错误只打一次（去重）：刷盘是周期性的，重复刷屏会把日志淹掉。
+func (s *Store) saveAndLog() {
+	if err := s.Save(); err != nil {
+		msg := err.Error()
+		if s.lastSaveErr != msg {
+			s.lastSaveErr = msg
+			log.Printf("ERROR: [keystore] 密钥落盘失败（用量统计等变更会丢失，请检查目录权限）：%s", msg)
+		}
+		return
+	}
+	s.lastSaveErr = ""
+}
+
 // Start 启动防抖刷盘 goroutine（幂等）。keys.json 未变时不写盘。
 func (s *Store) Start() {
 	s.startOnce.Do(func() {
@@ -493,7 +576,7 @@ func (s *Store) Start() {
 					if !s.dirty.Load() {
 						continue
 					}
-					_ = s.Save()
+					s.saveAndLog()
 				}
 			}
 		}()
@@ -506,7 +589,7 @@ func (s *Store) Stop() {
 		close(s.stopCh)
 		<-s.doneCh
 		if s.dirty.Load() {
-			_ = s.Save()
+			s.saveAndLog()
 		}
 	})
 }
