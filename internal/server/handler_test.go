@@ -15,9 +15,11 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/keystore"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/prompt"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/redisstore"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/reqlog"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/session"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/usage"
@@ -1830,5 +1832,288 @@ func TestChatMarkupRepairStrictModeRejectsUndeclaredTool(t *testing.T) {
 	msg := resp["choices"].([]any)[0].(map[string]any)["message"].(map[string]any)
 	if _, ok := msg["tool_calls"]; ok {
 		t.Fatalf("未声明的工具名不得转换: %#v", msg["tool_calls"])
+	}
+}
+
+// TestDistributionKeyAuthMatrix 端点权限矩阵（spec §5.3）：
+// 根密钥通吃；分发密钥只能打数据面；禁用/过期/未知分别给不同错误码。
+func TestDistributionKeyAuthMatrix(t *testing.T) {
+	ks, err := keystore.New(t.TempDir() + "/keys.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, boundPlain, _ := ks.Create(keystore.CreateInput{Name: "绑定", Mode: keystore.ModeBound, UIDs: []string{"u_a"}, Enabled: true})
+	_, globalPlain, _ := ks.Create(keystore.CreateInput{Name: "全局", Mode: keystore.ModeGlobal, Enabled: true})
+	_, deadPlain, _ := ks.Create(keystore.CreateInput{Name: "停用", Mode: keystore.ModeGlobal, Enabled: false})
+	_, expPlain, _ := ks.Create(keystore.CreateInput{Name: "过期", Mode: keystore.ModeGlobal, Enabled: true, ExpiresAt: time.Now().Add(-time.Minute).Unix()})
+
+	cases := []struct {
+		name   string
+		token  string
+		path   string
+		status int
+		code   string
+	}{
+		{"根密钥可访问 /status", "root-secret", "/status", 200, ""},
+		{"分发密钥不可访问 /status", boundPlain, "/status", 401, "invalid_api_key"},
+		{"全局分发密钥可访问 /v1/models", globalPlain, "/v1/models", 200, ""},
+		{"绑定分发密钥可访问 /v1/models", boundPlain, "/v1/models", 200, ""},
+		{"停用密钥 401", deadPlain, "/v1/models", 401, "api_key_disabled"},
+		{"过期密钥 401", expPlain, "/v1/models", 401, "api_key_expired"},
+		{"未知密钥 401", "sk-nope", "/v1/models", 401, "invalid_api_key"},
+		{"空 api_key 部署放行", "", "/v1/models", 200, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			apiKey := "root-secret"
+			if tc.name == "空 api_key 部署放行" {
+				apiKey = ""
+			}
+			h := NewHandler(Config{Pool: pool.New(""), Upstream: upstream.New(), APIKey: apiKey, Keys: ks})
+			req := httptest.NewRequest("GET", tc.path, nil)
+			if tc.token != "" {
+				req.Header.Set("Authorization", "Bearer "+tc.token)
+			}
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+			if rec.Code != tc.status {
+				t.Fatalf("status = %d, want %d (body=%s)", rec.Code, tc.status, rec.Body.String())
+			}
+			if tc.code != "" {
+				var body struct {
+					Error struct {
+						Code string `json:"code"`
+					} `json:"error"`
+				}
+				_ = json.Unmarshal(rec.Body.Bytes(), &body)
+				if body.Error.Code != tc.code {
+					t.Fatalf("code = %q, want %q", body.Error.Code, tc.code)
+				}
+			}
+		})
+	}
+}
+
+// TestBoundKeyStrictRouting bound 密钥的严格语义（AC3）：绑定号不可用时必须 503，
+// 即使池里有其他健康账号也绝不借用，且错误消息要带绑定明细。
+func TestBoundKeyStrictRouting(t *testing.T) {
+	ks, err := keystore.New(t.TempDir() + "/keys.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, boundPlain, err := ks.Create(keystore.CreateInput{Name: "绑定A", Mode: keystore.ModeBound, UIDs: []string{"u_a"}, Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := pool.New("")
+	p.Add(&auth.Auth{UID: "u_a", Nickname: "A"})
+	p.Add(&auth.Auth{UID: "u_b", Nickname: "B"}) // 故意保持健康：绑定号不可用时也绝不能借它
+	h := NewHandler(Config{Pool: p, Upstream: upstream.New(), APIKey: "root", Keys: ks, MaxRotate: 1})
+
+	// 1) 绑定号可用：不会因为鉴权被挡（上游不可达导致的失败与本次断言无关）。
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"cn:m","messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("Authorization", "Bearer "+boundPlain)
+	h.ServeHTTP(rec, req)
+	if rec.Code == http.StatusUnauthorized {
+		t.Fatalf("绑定密钥不该被鉴权拒绝: %s", rec.Body.String())
+	}
+
+	// 2) 绑定号暂停 → 池里仍有健康的 u_b，但必须 503 且带绑定明细。
+	p.Pause("u_a")
+	rec2 := httptest.NewRecorder()
+	req2 := httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"cn:m","messages":[{"role":"user","content":"hi"}]}`))
+	req2.Header.Set("Authorization", "Bearer "+boundPlain)
+	h.ServeHTTP(rec2, req2)
+	if rec2.Code != http.StatusServiceUnavailable {
+		t.Fatalf("绑定号不可用应 503，得到 %d (%s)", rec2.Code, rec2.Body.String())
+	}
+	if !strings.Contains(rec2.Body.String(), "绑定账号") {
+		t.Fatalf("503 应带绑定明细，得到 %s", rec2.Body.String())
+	}
+}
+
+// TestGlobalKeyIgnoresBinding bound 之外的密钥（根密钥与 global 模式密钥）选号不受绑定约束。
+func TestGlobalKeyIgnoresBinding(t *testing.T) {
+	ks, _ := keystore.New(t.TempDir() + "/keys.json")
+	_, globalPlain, _ := ks.Create(keystore.CreateInput{Name: "全局", Mode: keystore.ModeGlobal, UIDs: []string{"u_a"}, Enabled: true})
+	p := pool.New("")
+	p.Add(&auth.Auth{UID: "u_a", Nickname: "A"})
+	p.Pause("u_a")
+	h := NewHandler(Config{Pool: p, Upstream: upstream.New(), APIKey: "root", Keys: ks, MaxRotate: 1})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"cn:m","messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("Authorization", "Bearer "+globalPlain)
+	h.ServeHTTP(rec, req)
+	body := rec.Body.String()
+	if strings.Contains(body, "绑定账号") {
+		t.Fatalf("global 模式不该出绑定明细: %s", body)
+	}
+}
+
+// TestBoundKeyStickyGuard 粘性护栏：历史粘性指向非绑定号时，绑定密钥必须忽略它、
+// 解绑并回落到自己的绑定集合（否则 A 用户的会话会把请求带到 B 的账号上）。
+func TestBoundKeyStickyGuard(t *testing.T) {
+	ks, err := keystore.New(t.TempDir() + "/keys.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, plain, err := ks.Create(keystore.CreateInput{Name: "绑定A", Mode: keystore.ModeBound, UIDs: []string{"u_a"}, Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := newBindStore()
+	sess := session.New(session.Config{
+		TTL:       time.Minute,
+		Store:     st,
+		Available: func() []string { return []string{"u_a", "u_b"} },
+	})
+	p := testPoolWith(
+		&auth.Auth{UID: "u_a", AccessToken: "at-a", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "u_b", AccessToken: "at-b", ExpiresAt: 9999999999},
+	)
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) { return 200, sseOK, true })
+	h := NewHandler(Config{
+		Pool: p, Upstream: up, Session: sess, SoftCooldown: time.Minute,
+		APIKey: "root", Keys: ks,
+	})
+	sess.Bind("conv-1", "u_b") // 历史粘性指向非绑定号
+	req := httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","messages":[],"metadata":{"conversation_id":"conv-1"}}`))
+	req.Header.Set("Authorization", "Bearer "+plain)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	if uid, ok := st.lastUID("conv-1"); !ok || uid != "u_a" {
+		t.Fatalf("粘性必须收敛到绑定号 u_a，得到 %q (ok=%v)", uid, ok)
+	}
+}
+
+// TestRequestLogRecordsKeyIdentity 请求日志必须带上「哪把密钥」的标识（spec §7.3 / AC7），
+// 且只记 ID/名称、不记明文。
+func TestRequestLogRecordsKeyIdentity(t *testing.T) {
+	ks, err := keystore.New(t.TempDir() + "/keys.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	k, plain, err := ks.Create(keystore.CreateInput{Name: "小王", Mode: keystore.ModeGlobal, Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	metrics := reqlog.New(reqlog.Config{})
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999})
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) { return 200, sseOK, true })
+	h := NewHandler(Config{Pool: p, Upstream: up, APIKey: "root", Keys: ks, RequestLog: metrics})
+
+	req := httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","messages":[]}`))
+	req.Header.Set("Authorization", "Bearer "+plain)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	recent := metrics.Snapshot().Recent
+	if len(recent) != 1 {
+		t.Fatalf("应有 1 条请求记录，得到 %d", len(recent))
+	}
+	if recent[0].KeyID != k.ID || recent[0].KeyName != "小王" {
+		t.Fatalf("event key = %q/%q, want %q/小王", recent[0].KeyID, recent[0].KeyName, k.ID)
+	}
+	if strings.Contains(rec.Body.String(), plain) {
+		t.Fatal("响应体不得包含密钥明文")
+	}
+}
+
+// TestUsageCountedPerKey 分发密钥的 token 用量落在自己账上，根密钥不计数。
+func TestUsageCountedPerKey(t *testing.T) {
+	ks, err := keystore.New(t.TempDir() + "/keys.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	k, plain, err := ks.Create(keystore.CreateInput{Name: "计数", Mode: keystore.ModeGlobal, Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999})
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) { return 200, sseOK, true })
+	h := NewHandler(Config{Pool: p, Upstream: up, APIKey: "root", Keys: ks})
+	req := httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","messages":[]}`))
+	req.Header.Set("Authorization", "Bearer "+plain)
+	h.ServeHTTP(httptest.NewRecorder(), req)
+
+	list := ks.List()
+	if len(list) != 1 {
+		t.Fatalf("密钥数量 = %d", len(list))
+	}
+	if list[0].ID != k.ID || list[0].Usage.Req == 0 {
+		t.Fatalf("用量未落在该密钥上: %+v", list[0])
+	}
+	if list[0].LastUsedAt == 0 {
+		t.Fatal("LastUsedAt 未更新")
+	}
+
+	// 根密钥请求：不产生任何密钥计数（列表里只有上面那把，Req 不变）。
+	reqRoot := httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","messages":[]}`))
+	reqRoot.Header.Set("Authorization", "Bearer root")
+	h.ServeHTTP(httptest.NewRecorder(), reqRoot)
+	if got := ks.List()[0].Usage.Req; got != list[0].Usage.Req {
+		t.Fatalf("根密钥不该计入分发密钥: %d -> %d", list[0].Usage.Req, got)
+	}
+}
+
+// TestModelsFilteredByBoundRealm bound 密钥只能看到自己绑定域可路由的模型条目
+// （spec §6.6 / AC9）；根密钥与 global 模式密钥不过滤，输出逐字不变。
+func TestModelsFilteredByBoundRealm(t *testing.T) {
+	entries := []map[string]any{{"id": "cn:m1"}, {"id": "global:m2"}}
+	got := filterModelsForRealms(entries, map[string]bool{"global": true})
+	if len(got) != 1 || got[0]["id"] != "global:m2" {
+		t.Fatalf("过滤结果 = %+v", got)
+	}
+	if len(filterModelsForRealms(entries, nil)) != 2 {
+		t.Fatal("realm 集合为 nil 时不得过滤（根密钥/global 密钥路径）")
+	}
+	if len(filterModelsForRealms(entries, map[string]bool{})) != 0 {
+		t.Fatal("空 realm 集合应返回空列表")
+	}
+	if len(filterModelsForRealms(entries, map[string]bool{"cn": true})) != 1 {
+		t.Fatal("cn 集合只应保留 cn 条目")
+	}
+}
+
+// TestBoundRealmsFromPool 绑定身份的可路由域由「绑定账号的实际 Realm」推导；
+// 非绑定身份返回 nil（不过滤）。
+func TestBoundRealmsFromPool(t *testing.T) {
+	p := pool.New("")
+	p.Add(&auth.Auth{UID: "u_cn", Nickname: "cn号"})
+	p.Add(&auth.Auth{UID: "u_gl", Nickname: "gl号", Domain: "workbuddy.ai"})
+	h := NewHandler(Config{Pool: p, Upstream: upstream.New(), APIKey: "root"})
+
+	root := h.boundRealms(Identity{Root: true, Mode: keystore.ModeGlobal})
+	if root != nil {
+		t.Fatalf("根身份不该过滤: %+v", root)
+	}
+	global := h.boundRealms(Identity{KeyID: "k1", Mode: keystore.ModeGlobal})
+	if global != nil {
+		t.Fatalf("global 模式不该过滤: %+v", global)
+	}
+	cnOnly := h.boundRealms(Identity{KeyID: "k1", Mode: keystore.ModeBound, UIDs: []string{"u_cn"}})
+	if len(cnOnly) != 1 || !cnOnly["cn"] {
+		t.Fatalf("cn 绑定域 = %+v", cnOnly)
+	}
+	both := h.boundRealms(Identity{KeyID: "k1", Mode: keystore.ModeBound, UIDs: []string{"u_cn", "u_gl", "u_ghost"}})
+	if len(both) != 2 || !both["cn"] || !both["global"] {
+		t.Fatalf("双域绑定 = %+v", both)
+	}
+	none := h.boundRealms(Identity{KeyID: "k1", Mode: keystore.ModeBound, UIDs: []string{"u_ghost"}})
+	if len(none) != 0 {
+		t.Fatalf("绑定号全部不存在应得到空集合: %+v", none)
 	}
 }

@@ -113,7 +113,7 @@ try {
 		t.Fatal(err)
 	}
 	hf.Close()
-	for _, hash := range []string{"#taskscenter", "#accounts", "#usage", "#models", "#config", "#logs", "#packages"} {
+	for _, hash := range []string{"#taskscenter", "#accounts", "#keys", "#usage", "#models", "#config", "#logs", "#packages"} {
 		cmd := exec.Command(node, hf.Name(), "app.js")
 		cmd.Dir = "." // 测试工作目录 = internal/panel
 		cmd.Env = append(os.Environ(), "SMOKE_HASH="+hash)
@@ -901,5 +901,54 @@ process.stdout.write(JSON.stringify({
 	if strings.TrimSpace(string(out)) != want {
 		t.Fatalf("chart tooltip structure=%s\nwant %s（groups 应等于数据点数，loose 应为 0）",
 			strings.TrimSpace(string(out)), want)
+	}
+}
+
+// 请求记录的「密钥」列必须存在于 HTML 表头与 JS 渲染里（spec §7.3 / AC7），
+// 且列数（表头 11 列 / 空态 colspan）保持一致——否则表格会错位。
+func TestFrontendRequestLogKeyColumn(t *testing.T) {
+	p := newTestPanel()
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, httptest.NewRequest("GET", "/panel/", nil))
+	body := rec.Body.String()
+	if !strings.Contains(body, "<th>密钥</th>") {
+		t.Fatal("index.html 请求记录表头缺少「密钥」列")
+	}
+	raw, err := os.ReadFile("app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	js := string(raw)
+	for _, want := range []string{"function keyCell", "keyCell(e)", `colspan="11"`} {
+		if !strings.Contains(js, want) {
+			t.Fatalf("app.js 缺少 %q", want)
+		}
+	}
+}
+
+// 密钥页签必须完整存在（导航 + 视图 + 两个弹层 + JS 接线），
+// 否则页面能开但功能入口是空的（Go 侧不执行 JS，只能靠静态断言 + smoke）。
+func TestFrontendHasKeysView(t *testing.T) {
+	p := newTestPanel()
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, httptest.NewRequest("GET", "/panel/", nil))
+	body := rec.Body.String()
+	for _, want := range []string{
+		`data-view="keys"`, `id="view-keys"`, `id="keysBody"`,
+		`id="keyCreateVeil"`, `id="keyPlainVeil"`, `id="keyUids"`, `id="btnKeyCreate"`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("index.html 缺少 %s", want)
+		}
+	}
+	raw, err := os.ReadFile("app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	js := string(raw)
+	for _, want := range []string{"loadKeys", "renderKeys", "keyFormPayload", "showKeyPlain", "fmtKeyUIDs", "keyStatus", "keys: '密钥'"} {
+		if !strings.Contains(js, want) {
+			t.Fatalf("app.js 缺少 %s", want)
+		}
 	}
 }

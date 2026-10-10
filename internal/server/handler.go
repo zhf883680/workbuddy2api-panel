@@ -14,10 +14,12 @@ import (
 	"strings"
 
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/httpauth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/keystore"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
@@ -70,6 +72,10 @@ type Config struct {
 	// RequestLog 请求指标与脱敏 JSONL 归档（可选；nil = 不记录）。
 	RequestLog *reqlog.Recorder
 
+	// Keys 分发密钥存储（可选；nil = 未启用密钥体系，行为与只有根密钥时一致）。
+	// 面板签发、server 校验，同一实例注入（main 装配），改密钥下一个请求即生效。
+	Keys *keystore.Store
+
 	// RecordClientInfo 是否在请求日志里记录调用来源（客户端 IP / User-Agent）。
 	// 来自 logging.request_client_info（缺省 true）；关闭时 reqlog 事件的来源字段
 	// 保持为空，归档与面板都不出现来源信息。
@@ -110,6 +116,65 @@ const notFoundCooldown = 60 * time.Second
 // 返回 2xx 也不带本标识，宿主据此可识别"假成功"。
 const ServiceName = "workbuddy2api"
 
+// Identity 一次请求的调用方身份。
+//
+// Root 为真表示根密钥（config.api_key）—— 它能访问全部端点，且选号不受绑定约束。
+// 非 Root 即分发密钥：KeyID/KeyName 供日志与统计，Mode=bound 时 UIDs 限定候选账号集。
+type Identity struct {
+	Root    bool     // 根密钥
+	KeyID   string   // 分发密钥 ID；Root 为 "root"
+	KeyName string   // 分发密钥名称；Root 为 "根密钥"
+	Mode    string   // "global" | "bound"
+	UIDs    []string // Mode=bound 时的绑定账号
+}
+
+// AllowedUIDs 返回绑定集合；非绑定身份返回 nil（= 不限制候选集）。
+func (id Identity) AllowedUIDs() map[string]bool {
+	if id.Root || id.Mode != keystore.ModeBound {
+		return nil
+	}
+	out := make(map[string]bool, len(id.UIDs))
+	for _, u := range id.UIDs {
+		out[u] = true
+	}
+	return out
+}
+
+var rootIdentity = Identity{Root: true, KeyID: "root", KeyName: "根密钥", Mode: keystore.ModeGlobal}
+
+// authScope 端点权限域：决定分发密钥能否通过。
+type authScope int
+
+const (
+	scopeDataPlane  authScope = iota // /v1/*：根密钥 + 分发密钥
+	scopeManagement                  // /status 等：仅根密钥
+)
+
+// identityBox 请求级身份盒子。withAuth 在入口写一次，handler 与外层 trace defer 读。
+// 之所以用盒子而不是 r.WithContext：内层 handler 换出的新 *http.Request 对外层
+// ServeHTTP 闭包不可见（trace defer 捕获的是外层 r）。写发生在 handler 之前，
+// 读发生在其后（或由其派生的 goroutine），happens-before 成立。
+type identityBox struct{ v atomic.Pointer[Identity] }
+
+func (b *identityBox) Set(id Identity) { b.v.Store(&id) }
+
+func (b *identityBox) Get() Identity {
+	if p := b.v.Load(); p != nil {
+		return *p
+	}
+	return rootIdentity
+}
+
+type identityBoxKey struct{}
+
+// identityFrom 取当前请求身份；无盒子（测试直调 handler）时按根身份处理。
+func identityFrom(r *http.Request) Identity {
+	if b, ok := r.Context().Value(identityBoxKey{}).(*identityBox); ok {
+		return b.Get()
+	}
+	return rootIdentity
+}
+
 // Handler 主路由。
 type Handler struct {
 	cfg     Config
@@ -135,9 +200,9 @@ func NewHandler(cfg Config) *Handler {
 		cfg.PromptMode = "custom" // 缺省 custom：网关自有提示词
 	}
 	h := &Handler{cfg: cfg, mux: http.NewServeMux()}
-	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
-	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
-	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
+	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(scopeDataPlane, h.chatCompletions))
+	h.mux.HandleFunc("GET /v1/models", h.withAuth(scopeDataPlane, h.models))
+	h.mux.HandleFunc("GET /status", h.withAuth(scopeManagement, h.status))
 	h.mux.HandleFunc("GET /healthz", h.healthz)
 	if cfg.Panel != nil {
 		h.mux.Handle("/panel/", cfg.Panel) // /panel → /panel/ 由 ServeMux 自动重定向
@@ -146,6 +211,8 @@ func NewHandler(cfg Config) *Handler {
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// 身份盒子：withAuth 填写，handler 与外层 trace defer 读取。
+	r = r.WithContext(context.WithValue(r.Context(), identityBoxKey{}, &identityBox{}))
 	if h.cfg.RequestLog != nil && r.Method == http.MethodPost && r.URL.Path == "/v1/chat/completions" {
 		trace := &requestTrace{id: reqlog.NewRequestID(), start: time.Now()}
 		if h.loadLive().RecordClientInfo {
@@ -156,6 +223,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Request-Id", trace.id)
 		h.cfg.RequestLog.Begin()
 		defer func() {
+			// 身份在 withAuth 内写入盒子；此处（handler 返回后）读取，happens-before 成立。
+			trace.identity = identityFrom(r)
 			status := obs.status
 			if status == 0 {
 				status = http.StatusOK
@@ -168,13 +237,65 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.mux.ServeHTTP(w, r)
 }
 
-func (h *Handler) withAuth(next http.HandlerFunc) http.HandlerFunc {
+// withAuth 鉴权并写入身份。scope 决定分发密钥是否放行：
+//   - scopeDataPlane：/v1/*，根密钥与分发密钥都放行；
+//   - scopeManagement：仅根密钥（分发密钥一律 401，避免把管理面暴露给被分发方）。
+//
+// api_key 为空 = 不鉴权部署：恒根身份，行为与既有实现完全一致。
+func (h *Handler) withAuth(scope authScope, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !httpauth.VerifyBearer(r, h.loadLive().APIKey) {
-			writeOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "missing or invalid API key")
+		id, code := h.authenticate(r, scope)
+		if code != "" {
+			writeOpenAIError(w, http.StatusUnauthorized, code, authErrorMessage(code))
 			return
 		}
+		if b, ok := r.Context().Value(identityBoxKey{}).(*identityBox); ok {
+			b.Set(id)
+		}
 		next(w, r)
+	}
+}
+
+// authErrorMessage 把鉴权错误码翻成一句调用方看得懂的话。
+// 三种码都返回 401：能区分它们的前提是持有正确明文，因此不构成对外信息泄露。
+func authErrorMessage(code string) string {
+	switch code {
+	case "api_key_disabled":
+		return "this API key has been disabled"
+	case "api_key_expired":
+		return "this API key has expired"
+	default:
+		return "missing or invalid API key"
+	}
+}
+
+// authenticate 判定请求身份；返回的 code 非空表示拒绝（调用方回 401）。
+func (h *Handler) authenticate(r *http.Request, scope authScope) (Identity, string) {
+	rootKey := h.loadLive().APIKey
+	if rootKey == "" {
+		return rootIdentity, "" // 未启用鉴权：直接放行（与既有语义一致）
+	}
+	if httpauth.VerifyBearer(r, rootKey) {
+		return rootIdentity, ""
+	}
+	// 到这里根密钥已不匹配：管理面直接拒绝，数据面才继续查分发密钥。
+	if scope == scopeManagement || h.cfg.Keys == nil {
+		return Identity{}, "invalid_api_key"
+	}
+	tok, ok := httpauth.BearerToken(r)
+	if !ok {
+		return Identity{}, "invalid_api_key"
+	}
+	k, res := h.cfg.Keys.Lookup(tok)
+	switch res {
+	case keystore.LookupOK:
+		return Identity{KeyID: k.ID, KeyName: k.Name, Mode: k.Mode, UIDs: k.UIDs}, ""
+	case keystore.LookupDisabled:
+		return Identity{}, "api_key_disabled"
+	case keystore.LookupExpired:
+		return Identity{}, "api_key_expired"
+	default:
+		return Identity{}, "invalid_api_key"
 	}
 }
 
@@ -277,10 +398,49 @@ const (
 // models 返回模型列表：纯动态（缓存 10min），失败/无号返回空列表（无静态兜底——
 // 拉不出目录即意味着上游不可用，假名单只会让客户端选到 11102 的模型）。
 func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
+	// 绑定密钥按「绑定账号实际存在的域」过滤模型条目：只绑了 cn 号的密钥不该看到
+	// global: 前缀的模型（那些模型对它必然 503）。根密钥与 global 模式密钥不过滤，
+	// 输出与改动前逐字一致。过滤在响应阶段做，不动 10min 的全局目录缓存。
 	writeJSON(w, http.StatusOK, map[string]any{
 		"object": "list",
-		"data":   h.modelList(),
+		"data":   filterModelsForRealms(h.modelList(), h.boundRealms(identityFrom(r))),
 	})
+}
+
+// filterModelsForRealms 按允许的 realm 集合过滤模型条目（id 形如 "cn:xxx"/"global:xxx"）。
+// allowed 为 nil = 不过滤（根密钥 / global 模式密钥路径）；空集合 = 全部滤掉
+// （绑定账号全部不存在时，该密钥本来就没有可路由的域）。
+func filterModelsForRealms(entries []map[string]any, allowed map[string]bool) []map[string]any {
+	if allowed == nil {
+		return entries
+	}
+	out := make([]map[string]any, 0, len(entries))
+	for _, e := range entries {
+		id, _ := e["id"].(string)
+		realm := "cn" // 无前缀裸名缺省 cn，与 resolveModel 同口径
+		if i := strings.IndexByte(id, ':'); i > 0 && (id[:i] == "cn" || id[:i] == "global") {
+			realm = id[:i]
+		}
+		if allowed[realm] {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// boundRealms 绑定身份可路由的 realm 集合（由绑定账号的实际 Realm() 推导，池里不存在的
+// uid 直接忽略）；非绑定身份（根密钥 / global 模式）返回 nil = 不过滤。
+func (h *Handler) boundRealms(id Identity) map[string]bool {
+	if id.Root || id.Mode != keystore.ModeBound {
+		return nil
+	}
+	out := map[string]bool{}
+	for _, uid := range id.UIDs {
+		if a := h.cfg.Pool.AuthByUID(uid); a != nil {
+			out[a.Realm()] = true
+		}
+	}
+	return out
 }
 
 // fmtCreditsPrefix 从上游 credits 原文提取倍率并格式化为 "[x0.05 credit]"。
@@ -551,11 +711,21 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	defer st.done()
 
+	// 调用方身份（经过 withAuth 填写）：决定选号候选集与用量归属。
+	// allowed 非 nil 即"绑定模式"，候选集被限制在绑定账号内，全不可用时 503 而非借号。
+	id := identityFrom(r)
+	allowed := id.AllowedUIDs()
+	// 流水行在本函数返回前打印（早于 ServeHTTP 的 trace defer），故身份在这里就给 st。
+	st.identity = id
+
 	tried := map[string]bool{}
 	var lastErr error
 	// modelBlock 记录本次是否因「模型级冷却」而选不到号（下方 acct==nil 分支填充）。
 	// 默认零值 Blocked=false = 按既有的"没有可用账号"口径报错。
 	var modelBlock pool.ModelBlockStatus
+	// bindErrMsg 绑定密钥的选择性失败原因（下方 acct==nil 分支填充）；
+	// 非空时优先作为 503 的 message，便于调用方直接看到"是哪个绑定号不行"。
+	var bindErrMsg string
 
 	// 会话粘性：从请求体提取会话键并解析绑定号（找不到/无效则 stickyUID 为空，走普通轮换）。
 	// ExtractKey 与粘性开关解耦（issue #35 侧）：关闭粘性时会话头族的聚合主键仍按
@@ -676,6 +846,14 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				HasTPS:           delta.HasTokensPerSecond,
 			}, delta.HasTotalTokens || delta.HasCompletionTokens || delta.HasPromptTokens)
 		}
+		// 分发密钥的累计用量：与 Usage.Add 同一处、同一口径（每次上游尝试各记一次，
+		// 重试与失败都计），因此面板密钥表格的列名标注为「调用（含重试）」。
+		// 根密钥（Root）不计数——它不是被分发的对象。
+		if h.cfg.Keys != nil && !id.Root {
+			h.cfg.Keys.NoteUsage(id.KeyID,
+				delta.HasTotalTokens || delta.HasCompletionTokens || delta.HasPromptTokens,
+				delta.PromptTokens, delta.CompletionTokens)
+		}
 	}
 
 	// 系统提示词改写（出站前、轮转前；每个请求一次）。
@@ -733,7 +911,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	for i := 0; i < h.cfg.MaxRotate; i++ {
 		// 选号：粘性号优先（PickByUIDForModel 已校验该模型可用性 + 在途未满），否则普通轮换。
 		var acct *auth.Auth
-		if stickyUID != "" {
+		if stickyUID != "" && (allowed == nil || allowed[stickyUID]) {
 			acct = h.cfg.Pool.PickByUIDForModel(stickyUID, bareModel)
 			if acct == nil || (realm != "" && acct.Realm() != realm) {
 				// 粘性号在当前模型不可用（冷却/占满/该模型被 6004 限额）或 realm 不符 → 解绑，
@@ -741,11 +919,20 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				unbindSticky()
 				acct = nil
 			}
+		} else if stickyUID != "" {
+			// 粘性号不属于本密钥的绑定集合：立即解绑，绝不让请求被带到别人的号上。
+			// 粘性键由请求内容推导、跨密钥共享，缺这道护栏会直接串号。
+			unbindSticky()
 		}
 		if acct == nil {
 			// 模型感知 + realm 感知选号：模型非空时启用 6004 模型级冷却豁免
 			// （healthyForModel），realm 谓词过滤跨域账号。
-			acct = h.cfg.Pool.PickExcludingForRealm(tried, bareModel, realm)
+			// 绑定密钥（allowed 非 nil）走绑定版入口：候选集被限制且兜底同样不外溢。
+			if allowed != nil {
+				acct = h.cfg.Pool.PickExcludingForRealmBound(tried, bareModel, realm, allowed)
+			} else {
+				acct = h.cfg.Pool.PickExcludingForRealm(tried, bareModel, realm)
+			}
 		}
 		if acct == nil {
 			st.status = http.StatusServiceUnavailable
@@ -755,6 +942,16 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 两者此前都报 no_healthy_account，导致「模型不可用」被读成「号全挂了」。
 			// 在这里取一次快照，供下方错误构造区分（issue #102 附带发现 1）。
 			modelBlock = h.cfg.Pool.ModelBlocked(bareModel)
+			if allowed != nil {
+				uids := append([]string(nil), id.UIDs...)
+				if len(uids) == 0 {
+					bindErrMsg = "该密钥为绑定模式但未配置任何账号"
+				} else if s := pool.SummarizeUnavailable(h.cfg.Pool.ExplainBound(uids, realm, bareModel)); s != "" {
+					bindErrMsg = fmt.Sprintf("绑定账号 %d 个均不可用：%s", len(uids), s)
+				} else {
+					bindErrMsg = fmt.Sprintf("绑定账号 %d 个均不可用", len(uids))
+				}
+			}
 			break
 		}
 		st.uid = acct.UID
@@ -1164,8 +1361,14 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	//
 	// 用 400 而非 503：这是"你选的这个模型当前不可用"，不是"服务端暂时过载"。
 	// 换号重试必然同样失败，客户端不该按可重试错误处理。
+	// 绑定密钥的失败优先用自己的明细：它的成因（哪个绑定号为什么不行）比通用文案
+	// 或全局模型级阻塞快照更贴近调用方要解决的问题，且仍是 503（可重试语义不变）。
+	if bindErrMsg != "" {
+		code = "no_healthy_account"
+		status = http.StatusServiceUnavailable
+		msg = bindErrMsg
+	}
 	if modelBlock.Blocked {
-		code = "model_unavailable"
 		// 有上游原文时保留它（含 requestId，用户要拿去向上游反馈），只把"有几个号
 		// 被挡、最早何时解封"这类本地调度信息放进 gateway_hint。
 		if !upstreamMsgPassed {

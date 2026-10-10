@@ -58,7 +58,10 @@ type chatStat struct {
 	hasCredit        bool
 	promptTokens     int64
 	completionTokens int64
-	totalTokens      int64
+	// identity 本次请求的调用方身份（chatCompletions 内采集）。done() 在本函数返回前
+	// 执行（早于 ServeHTTP 的 trace defer），所以这里单独持有，供流水行打印密钥列。
+	identity    Identity
+	totalTokens int64
 	// 缓存命中观测（usage.prompt_cache_hit_tokens / miss）：上游给到才有效。
 	// 供 usage 桶命中率维度与 reqlog 逐次记录；缺失时 hasCache=false 不参与统计。
 	cacheHit  int64
@@ -89,7 +92,24 @@ func (s *chatStat) done() {
 	}
 	s.logged = true
 	logChatRowEx(s.ttfb, time.Since(s.start), s.model, s.mode, s.uid, s.nick, s.status, s.toks,
-		s.requestID, s.outcome, s.attempts, s.credit, s.hasCredit, s.clientIP, s.userAgent)
+		s.requestID, s.outcome, s.attempts, s.credit, s.hasCredit, s.clientIP, s.userAgent, s.keyLabel())
+}
+
+// keyLabel 流水行的密钥标识「名称(id8)」；无身份（未启用密钥体系）时返回空串，
+// 此时不追加 key 段，旧行格式保持不变。
+func (s *chatStat) keyLabel() string {
+	if s == nil || s.identity.KeyID == "" {
+		return ""
+	}
+	id := s.identity.KeyID
+	if len(id) > 8 {
+		id = id[:8]
+	}
+	name := s.identity.KeyName
+	if name == "" {
+		name = id
+	}
+	return name + "(" + id + ")"
 }
 
 // chatStatsReader 在流式透传时抓取 SSE 末帧的 usage.completion_tokens 精确值，
@@ -345,6 +365,9 @@ type requestTrace struct {
 	id    string
 	start time.Time
 	stat  *chatStat
+	// identity 本次请求的调用方身份（withAuth 写入，ServeHTTP 的 defer 采集）：
+	// 供归档事件与 stdout 流水行标注"这条请求是谁打进来的"。
+	identity Identity
 	// 调用来源，进入 handler 时一次性采集（见 ServeHTTP / captureClientInfo）。
 	clientIP  string
 	userAgent string
@@ -425,6 +448,8 @@ func (t *requestTrace) event(status int) reqlog.Event {
 	}
 	e.ClientIP = t.clientIP
 	e.UserAgent = t.userAgent
+	e.KeyID = t.identity.KeyID
+	e.KeyName = t.identity.KeyName
 	if e.Outcome == "" {
 		if status >= 200 && status < 300 {
 			e.Outcome = reqlog.OutcomeSuccess
@@ -487,14 +512,14 @@ const (
 //     uid8 时人眼无法判断是哪个号，要辨认必须再查 auths/，排障多一跳；
 //   - toks<0 表示 usage 缺失，显示 "-"。
 func logChatRow(ttfb, total time.Duration, model, mode, uid, nick string, status int, toks int) {
-	logChatRowEx(ttfb, total, model, mode, uid, nick, status, toks, "", "", 0, 0, false, "", "")
+	logChatRowEx(ttfb, total, model, mode, uid, nick, status, toks, "", "", 0, 0, false, "", "", "")
 }
 
 // logChatRowEx 是带请求 ID、结果、重试、积分与调用来源字段的扩展流水行。旧调用保持
 // 原格式；requestID 非空时才追加扩展字段；来源两参均为空时不追加来源段。
 func logChatRowEx(ttfb, total time.Duration, model, mode, uid, nick string, status int, toks int,
 	requestID, outcome string, attempts int, credit float64, hasCredit bool,
-	clientIP, userAgent string) {
+	clientIP, userAgent, keyLabel string) {
 	if !chatLogEnabled {
 		return
 	}
@@ -536,6 +561,11 @@ func logChatRowEx(ttfb, total time.Duration, model, mode, uid, nick string, stat
 	// 调用来源：IP 用可解析的裸值（便于 grep），UA 用 ShortUA 压缩后的客户端标签
 	// 并加引号（标签内可能含空格，如 `OpenAI/Python 1.30.0` 只会取到 OpenAI/Python）。
 	// 两者都未采集时不追加，旧行格式保持不变。
+	// 密钥列：只在有身份时追加（未启用密钥体系时旧行格式逐字不变）。
+	keySeg := ""
+	if keyLabel != "" {
+		keySeg = " key=" + keyLabel + " |"
+	}
 	src := ""
 	if clientIP != "" || userAgent != "" {
 		ua := "-"
@@ -544,7 +574,7 @@ func logChatRowEx(ttfb, total time.Duration, model, mode, uid, nick string, stat
 		}
 		src = fmt.Sprintf(" src=%s ua=%s |", dashIfEmpty(clientIP), ua)
 	}
-	fmt.Fprintf(chatLogOut, "| #%03d | %s | %s | %s | %d | %s | TTFB=%s | tok=%s | %s | total=%.1fs |%s%s\n",
+	fmt.Fprintf(chatLogOut, "| #%03d | %s | %s | %s | %d | %s | TTFB=%s | tok=%s | %s | total=%.1fs |%s%s%s\n",
 		seq,
 		time.Now().Format("15:04:05"),
 		model,
@@ -556,6 +586,7 @@ func logChatRowEx(ttfb, total time.Duration, model, mode, uid, nick string, stat
 		logfmt.Pad(tokpsField, chatRateWidth),
 		total.Seconds(),
 		extra,
+		keySeg,
 		src,
 	)
 }

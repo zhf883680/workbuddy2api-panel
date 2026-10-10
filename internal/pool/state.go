@@ -3,6 +3,7 @@
 package pool
 
 import (
+	"fmt"
 	"log"
 	"sort"
 	"strings"
@@ -674,4 +675,112 @@ func (p *Pool) rateLimitedModelsLocked(e *entry, now time.Time) []RateLimitedMod
 		return nil
 	}
 	return rows
+}
+
+// UnavailableReason 一个绑定账号对某次请求的可用性判定（供 bound 密钥的 503 文案）。
+// Code 取值：ok / not_found / disabled / paused / realm_mismatch / cooling /
+// model_cooling / in_flight_full / floor_blocked。
+type UnavailableReason struct {
+	UID   string    `json:"uid"`
+	Code  string    `json:"code"`
+	Until time.Time `json:"until,omitempty"` // cooling/model_cooling 时的解锁时刻
+}
+
+// ExplainBound 逐个解释绑定账号为何可用/不可用。纯只读，不改变任何池状态。
+//
+// 判定顺序与选号口径一致（选号看的是"能不能被选中"，这里看的是"为什么不能"）：
+// 不存在 → 禁用 → 暂停 → 域不匹配 → 模型级冷却 → 账号级冷却 → 在途占满 → 积分保底。
+// model 为空时不涉及模型维度；realm 为空时不叠加域过滤。
+func (p *Pool) ExplainBound(uids []string, realm, model string) []UnavailableReason {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	now := time.Now()
+	out := make([]UnavailableReason, 0, len(uids))
+	for _, uid := range uids {
+		e, ok := p.byUID[uid]
+		switch {
+		case !ok:
+			out = append(out, UnavailableReason{UID: uid, Code: "not_found"})
+		case e.disabled:
+			out = append(out, UnavailableReason{UID: uid, Code: "disabled"})
+		case e.paused:
+			out = append(out, UnavailableReason{UID: uid, Code: "paused"})
+		case realm != "" && e.a.Realm() != realm:
+			out = append(out, UnavailableReason{UID: uid, Code: "realm_mismatch"})
+		case model != "" && !e.healthyForModel(now, model):
+			out = append(out, UnavailableReason{UID: uid, Code: "model_cooling", Until: e.expiry(now)})
+		case !e.healthy(now):
+			out = append(out, UnavailableReason{UID: uid, Code: "cooling", Until: e.expiry(now)})
+		case p.inFlightFull(e):
+			out = append(out, UnavailableReason{UID: uid, Code: "in_flight_full"})
+		case p.floorBlockedForRealmModel(e, model, realm, now):
+			out = append(out, UnavailableReason{UID: uid, Code: "floor_blocked"})
+		default:
+			out = append(out, UnavailableReason{UID: uid, Code: "ok"})
+		}
+	}
+	return out
+}
+
+// SummarizeUnavailable 把 ExplainBound 的结果压成一句中文摘要，供 503 的 message 拼接。
+// 全部可用（或输入为空）时返回空串 —— 调用方据此判断"要不要加这句解释"。
+func SummarizeUnavailable(rs []UnavailableReason) string {
+	var notFound, disabled, paused, realmMismatch, cooling, modelCooling, inFlight, floorBlocked int
+	var earliest time.Time
+	for _, r := range rs {
+		switch r.Code {
+		case "not_found":
+			notFound++
+		case "disabled":
+			disabled++
+		case "paused":
+			paused++
+		case "realm_mismatch":
+			realmMismatch++
+		case "cooling":
+			cooling++
+		case "model_cooling":
+			modelCooling++
+		case "in_flight_full":
+			inFlight++
+		case "floor_blocked":
+			floorBlocked++
+		}
+		if !r.Until.IsZero() && (earliest.IsZero() || r.Until.Before(earliest)) {
+			earliest = r.Until
+		}
+	}
+	if notFound+disabled+paused+realmMismatch+cooling+modelCooling+inFlight+floorBlocked == 0 {
+		return ""
+	}
+	parts := make([]string, 0, 8)
+	if cooling > 0 {
+		s := fmt.Sprintf("%d 个冷却中", cooling)
+		if !earliest.IsZero() {
+			s += fmt.Sprintf("（最早 %s 解锁）", earliest.Local().Format("15:04"))
+		}
+		parts = append(parts, s)
+	}
+	if modelCooling > 0 {
+		parts = append(parts, fmt.Sprintf("%d 个被该模型限流", modelCooling))
+	}
+	if inFlight > 0 {
+		parts = append(parts, fmt.Sprintf("%d 个在途占满", inFlight))
+	}
+	if floorBlocked > 0 {
+		parts = append(parts, fmt.Sprintf("%d 个积分触底", floorBlocked))
+	}
+	if disabled > 0 {
+		parts = append(parts, fmt.Sprintf("%d 个已禁用", disabled))
+	}
+	if paused > 0 {
+		parts = append(parts, fmt.Sprintf("%d 个已暂停选号", paused))
+	}
+	if realmMismatch > 0 {
+		parts = append(parts, fmt.Sprintf("%d 个域不匹配", realmMismatch))
+	}
+	if notFound > 0 {
+		parts = append(parts, fmt.Sprintf("%d 个账号不存在", notFound))
+	}
+	return strings.Join(parts, "、")
 }

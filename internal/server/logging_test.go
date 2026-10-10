@@ -327,7 +327,7 @@ func TestLogChatRowExtendedFields(t *testing.T) {
 	withChatLog(t)
 	out := captureStdout(t, func() {
 		logChatRowEx(10*time.Millisecond, 2*time.Second, "glm-5.3", "stream", "u123456789", "示例号",
-			http.StatusOK, 42, "req-abc123", reqlog.OutcomeSuccess, 2, 1.25, true, "", "")
+			http.StatusOK, 42, "req-abc123", reqlog.OutcomeSuccess, 2, 1.25, true, "", "", "")
 	})
 	for _, want := range []string{"rid=req-abc123", "out=success", "try=2", "credit=1.2500"} {
 		if !strings.Contains(out, want) {
@@ -346,7 +346,7 @@ func TestLogChatRowSourceFields(t *testing.T) {
 	out := captureStdout(t, func() {
 		logChatRowEx(10*time.Millisecond, 2*time.Second, "glm-5.3", "stream", "u123456789", "示例号",
 			http.StatusOK, 42, "req-abc123", reqlog.OutcomeSuccess, 1, 0, false,
-			"203.0.113.7", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+			"203.0.113.7", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36", "")
 	})
 	for _, want := range []string{`src=203.0.113.7`, `ua="Chrome/120.0.0.0"`} {
 		if !strings.Contains(out, want) {
@@ -482,5 +482,24 @@ func TestHealthzDoesNotLogTableRow(t *testing.T) {
 	})
 	if strings.Contains(out, "| #") {
 		t.Errorf("healthz/models/status must not emit table rows:\n%s", out)
+	}
+}
+
+// 密钥标识必须落进流水行；未启用密钥体系（无身份）时不追加 key 段，旧格式不变。
+func TestLogChatRowKeyField(t *testing.T) {
+	withChatLog(t)
+	out := captureStdout(t, func() {
+		logChatRowEx(10*time.Millisecond, 2*time.Second, "glm-5.3", "stream", "u123456789", "示例号",
+			http.StatusOK, 42, "req-abc123", reqlog.OutcomeSuccess, 1, 0, false, "", "", "小王(k1a2b3c4)")
+	})
+	if !strings.Contains(out, "key=小王(k1a2b3c4)") {
+		t.Errorf("key field missing:\n%s", out)
+	}
+	legacy := captureStdout(t, func() {
+		logChatRowEx(10*time.Millisecond, 2*time.Second, "glm-5.3", "stream", "u123456789", "示例号",
+			http.StatusOK, 42, "req-abc123", reqlog.OutcomeSuccess, 1, 0, false, "", "", "")
+	})
+	if strings.Contains(legacy, "key=") {
+		t.Errorf("empty identity must not add key field:\n%s", legacy)
 	}
 }
