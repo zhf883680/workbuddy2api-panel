@@ -29,6 +29,11 @@ type responsesAdapter struct {
 	status int
 	buf    bytes.Buffer
 	done   bool // 流式：response.completed 已发出（防重复补帧）
+
+	// wroteReal 真实响应头是否已写出。流式下 writeReal 每帧都会被调用，而真实
+	// WriteHeader 只允许一次：重复调用会被 net/http 记成
+	// "superfluous response.WriteHeader call from ..."（面板运行日志里会刷屏）。
+	wroteReal bool
 }
 
 func newResponsesAdapter(inner http.ResponseWriter, stream bool, model string, origReq, chatReq []byte) *responsesAdapter {
@@ -98,8 +103,15 @@ func (a *responsesAdapter) Flush() {
 	}
 }
 
-// writeReal 首次输出时写真实响应头并写出 body。
+// writeReal 首次输出时写真实响应头并写出 body；后续帧只追加 body。
+//
+// 幂等是必须的：流式每帧都会走到这里，而 http.ResponseWriter.WriteHeader 只能
+// 生效一次（第二次起 net/http 会打 superfluous 告警，且不改状态码）。
 func (a *responsesAdapter) writeReal(contentType string, body []byte) error {
+	if a.wroteReal {
+		_, err := a.inner.Write(body)
+		return err
+	}
 	h := a.inner.Header()
 	h.Set("Content-Type", contentType)
 	status := a.status
@@ -107,6 +119,7 @@ func (a *responsesAdapter) writeReal(contentType string, body []byte) error {
 		status = http.StatusOK
 	}
 	a.inner.WriteHeader(status)
+	a.wroteReal = true
 	_, err := a.inner.Write(body)
 	return err
 }

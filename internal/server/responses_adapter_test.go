@@ -29,6 +29,48 @@ func TestResponsesAdapterStreamsEvents(t *testing.T) {
 	}
 }
 
+// headerCounter 统计真实 WriteHeader 次数：net/http 对第二次调用会打
+// 「superfluous response.WriteHeader call」告警（httptest.NewRecorder 不会），
+// 这里把「只能写一次头」这条约束变成断言。
+type headerCounter struct {
+	http.ResponseWriter
+	calls int
+}
+
+func (c *headerCounter) WriteHeader(code int) {
+	c.calls++
+	c.ResponseWriter.WriteHeader(code)
+}
+
+// 多帧流式：真实响应头必须只写一次。回归自线上日志
+// 「http: superfluous response.WriteHeader call from ...responsesAdapter」——
+// writeReal 此前每帧都调一次 WriteHeader。
+func TestResponsesAdapterWritesRealHeaderOnce(t *testing.T) {
+	rec := httptest.NewRecorder()
+	cw := &headerCounter{ResponseWriter: rec}
+	a := newResponsesAdapter(cw, true, "glm-5.2", []byte(adapterSampleReq), []byte(`{"model":"glm-5.2"}`))
+	a.WriteHeader(http.StatusOK) // 内层头被吞
+	for i := 0; i < 5; i++ {
+		_, _ = io.WriteString(a, "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"片段\"}}]}\n\n")
+	}
+	a.Finish()
+	if cw.calls != 1 {
+		t.Fatalf("WriteHeader 被调用 %d 次，应恰好 1 次（重复调用会被 net/http 记为 superfluous）", cw.calls)
+	}
+}
+
+// 非流式与错误映射同样只写一次头。
+func TestResponsesAdapterNonStreamWritesHeaderOnce(t *testing.T) {
+	rec := httptest.NewRecorder()
+	cw := &headerCounter{ResponseWriter: rec}
+	a := newResponsesAdapter(cw, false, "glm-5.2", []byte(`{"model":"glm-5.2","input":"你好"}`), []byte(`{"model":"glm-5.2"}`))
+	_, _ = io.WriteString(a, `{"choices":[{"index":0,"message":{"content":"你好"}}]}`)
+	a.Finish()
+	if cw.calls != 1 {
+		t.Fatalf("非流式 WriteHeader 被调用 %d 次，应恰好 1 次", cw.calls)
+	}
+}
+
 // 关键：上游没发 [DONE] 时，Finish 必须兜底补上，否则 SDK 流永远等不到 response.completed。
 func TestResponsesAdapterCompletesOnFinish(t *testing.T) {
 	rec := httptest.NewRecorder()
