@@ -691,6 +691,7 @@ http://127.0.0.1:7863/panel/
 | 端点 | 鉴权 | 说明 |
 |---|---|---|
 | `POST /v1/chat/completions` | Bearer（`api_key` 非空时） | OpenAI 兼容补全；流式/非流式；请求体上限 8 MiB |
+| `POST /v1/responses` | Bearer（`api_key` 非空时） | OpenAI **Responses API**（Codex CLI / openai SDK 用）；流式（`response.*` 事件流）与非流式；协议翻译由 CLIProxyAPI 翻译器完成，代理行为与 `/v1/chat/completions` 同源（同一套选号/绑定/冷却/DSML 修复）。**字段支持范围与已知丢弃项见下节** |
 | `GET /v1/models` | Bearer（`api_key` 非空时） | 模型列表（纯动态拉取，缓存 1h；失败返回空列表 + 5min 负缓存）；每模型带 `context_length`/`max_output_tokens`（四级查找链：上游目录 → 内置知识表 → model.json 缓存 → models.dev）、`reasoning_supported_efforts`/`reasoning_default_effort` 思考档位及描述/标签/倍率等全字段（上游有返回时） |
 | `GET /status` | Bearer**仅根密钥** | 账号状态汇总 + 每账号详情（积分/冷却/熔断/在途/粘性）+ `model_locks`（按「域 + 模型」聚合的限流视图：可选 / 总数、锁定账号数、`state`、最早解锁与全池解锁时间、限流原因；无锁定为空） |
 | `GET /healthz` | 无 | 健康检查：有 healthy 且未占满账号返回 200，否则 503；响应带身份标识（见下） |
@@ -700,6 +701,54 @@ http://127.0.0.1:7863/panel/
 > **根密钥与分发密钥**：`config.json` 里的 `api_key` 是**根密钥**——它通吃全部端点（含 `/status` 与管理面板 `/panel/*`），且选号不受任何绑定约束。
 > 面板「密钥」页签签发的**分发密钥**只能访问 `/v1/chat/completions` 与 `/v1/models`：访问 `/status`、`/panel/api/*` 一律 401（管理面不向被分发方开放）。
 > 分发密钥被禁用/过期/重置/删除后**下一个请求立即生效**（无需重启）；`/v1/models` 对绑定模式的密钥只列出其绑定账号所在域可路由的模型。
+
+### Responses API（`POST /v1/responses`）支持范围
+
+给 Codex CLI（`wire_api = "responses"`）与 openai Python/Node SDK 的 `responses.create()` 用。
+
+**已支持**
+
+| 能力 | 说明 |
+|---|---|
+| 流式 / 非流式 | `stream:true` 输出 `response.created` … `response.completed` 事件流；`stream:false` 输出完整 response 对象 |
+| 输入形态 | `instructions`、`input`（裸字符串或 item 数组）、`message` / `input_text` / `input_image`、`function_call`、`function_call_output` |
+| 工具调用 | 扁平 `function` 工具、`tool_choice`、`parallel_tool_calls`；多轮「`function_call` → `function_call_output`」正确映射成上游的 `assistant.tool_calls` + `role:tool` |
+| 其他透传 | `reasoning.effort`（→ `reasoning_effort`）、`max_output_tokens`（→ `max_tokens`）、realm 前缀（`cn:` / `global:`） |
+| 密钥体系 | 根密钥与面板签发的分发密钥都可用；绑定模式的严格选号、粘性护栏、每密钥用量统计全部继承（与 `/v1/chat/completions` 同源） |
+
+**已知限制（字段会被翻译器丢弃，请求照常返回 200，不报错）**
+
+| 字段 | 影响 |
+|---|---|
+| `previous_response_id` | 不做服务端续轮：上下文不会自动带上，需客户端把历史放进 `input` |
+| `tools[].type != "function"`（`web_search` / `file_search` / `code_interpreter` / `computer_use_preview` / `mcp`） | 内置工具不被执行（上游没有这些能力），模型只能凭自身知识回答 |
+| `store` | 不落盘、不可检索；`GET /v1/responses/{id}` 未实现（404） |
+| `reasoning.summary` / `include` / `text.verbosity` / `metadata` | 不影响正常收发，但不体现在输出里 |
+
+**未实现**：`GET /v1/responses/{id}`、`POST /v1/responses/{id}/cancel`、`DELETE`，以及 Anthropic `/v1/messages`、Gemini 等其他协议端点。
+
+**Codex CLI 配置片段**
+
+```toml
+# ~/.codex/config.toml
+model = "global:glm-5.2"          # 不带前缀即走 cn 域
+model_provider = "workbuddy"
+
+[model_providers.workbuddy]
+name = "workbuddy2api"
+base_url = "http://127.0.0.1:7863/v1"
+env_key = "WORKBUDDY_API_KEY"     # 其值 = config.json 的 api_key 或面板签发的分发密钥
+wire_api = "responses"
+```
+
+**真实验证脚本**：`scripts/responses_sdk_smoke.py`（用 openai Python SDK 跑非流式 + 流式 + 工具多轮）
+
+```bash
+pip install openai
+scripts/responses_sdk_smoke.py --base-url http://127.0.0.1:7863 --api-key <key> --model global:glm-5.2
+```
+
+**依赖与体积**：Responses 翻译复用 [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) 的 `sdk/translator`（`v8.0.23`，只 import 该包与 `sdk/translator/builtin`）。代价：Go 工具链要求 ≥ 1.26、go.mod 间接依赖约 35 个、二进制体积 13 MB → 23 MB（实测）。
 
 `/healthz` 响应示例（200 / 503 同结构，仅状态码与计数变化）：
 
