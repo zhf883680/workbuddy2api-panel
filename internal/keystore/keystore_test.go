@@ -2,6 +2,7 @@ package keystore
 
 import (
 	"errors"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -108,3 +109,51 @@ func TestUpdateRotateRemove(t *testing.T) {
 }
 
 func strPtr(s string) *string { return &s }
+
+func TestPersistAndReload(t *testing.T) {
+	path := t.TempDir() + "/keys.json"
+	s, _ := New(path)
+	k, plain, _ := s.Create(CreateInput{Name: "持久", Mode: ModeBound, UIDs: []string{"u_a"}, Enabled: true})
+	s.NoteUsage(k.ID, false, 10, 20)
+	if err := s.Save(); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("Stat: %v", err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("权限应 0600，得到 %v", info.Mode().Perm())
+	}
+
+	s2, err := New(path)
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if _, res := s2.Lookup(plain); res != LookupOK {
+		t.Fatalf("重载后应命中，得到 %v", res)
+	}
+	list := s2.List()
+	if len(list) != 1 || list[0].Usage.Req != 1 || list[0].Usage.Err != 1 ||
+		list[0].Usage.PromptTokens != 10 || list[0].Usage.CompletionTokens != 20 {
+		t.Fatalf("统计未持久化: %+v", list)
+	}
+	if list[0].LastUsedAt == 0 {
+		t.Fatalf("LastUsedAt 未更新")
+	}
+}
+
+func TestNoteUsageDebouncedFlush(t *testing.T) {
+	path := t.TempDir() + "/keys.json"
+	s, _ := New(path)
+	k, _, _ := s.Create(CreateInput{Name: "防抖", Mode: ModeGlobal, Enabled: true})
+	s.flushEvery = 20 * time.Millisecond
+	s.Start()
+	defer s.Stop()
+	s.NoteUsage(k.ID, true, 1, 2) // 只标脏，不立刻落盘
+	time.Sleep(120 * time.Millisecond)
+	s2, _ := New(path)
+	if got := s2.List()[0].Usage.Req; got != 1 {
+		t.Fatalf("防抖刷盘后 req = %d, want 1", got)
+	}
+}
