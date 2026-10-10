@@ -45,8 +45,12 @@ async function api(path, opts = {}) {
   if (k) h['Authorization'] = 'Bearer ' + k;
   if (opts.body) h['Content-Type'] = 'application/json';
   const r = await fetch('/panel/api/' + path, Object.assign({}, opts, { headers: h }));
-  if (r.status === 401) { openKey(); throw new Error('密钥无效或未填写'); }
   const d = await r.json().catch(() => ({}));
+  // 401 / 429 都属于鉴权门：弹密钥门并把原因写在门上。
+  //   401 → 密钥不对；429 → 失败次数超限被临时锁定（后端 loginlock），
+  //   锁定期内正确密钥同样被拒，只能等解锁。
+  if (r.status === 401) { const m = '密钥不正确，请重新输入。'; openKeyWith(m); throw new Error(m); }
+  if (r.status === 429) { const m = d.error || '登录失败次数过多，请稍后再试。'; openKeyWith(m); throw new Error(m); }
   if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
   return d;
 }
@@ -316,6 +320,15 @@ function formatRate(rate) {
 
 /* ── 密钥门 ───────────────────────────────────────────────────────── */
 function openKey() { $('keyVeil').classList.add('on'); setTimeout(() => $('keyInput').focus(), 60); }
+/* openKeyWith 弹密钥门并写明原因，同时停掉 5s 轮询：挂着的旧密钥继续每 5s 撞一次
+   只会把失败计数越撞越多（后端锁定按来源累计失败，重启进程才清）。重新输入正确
+   密钥后由 start() 恢复轮询。 */
+function openKeyWith(msg) {
+  if (refTimer) { clearInterval(refTimer); refTimer = null; }
+  $('keyErr').textContent = msg;
+  $('keyErr').hidden = false;
+  openKey();
+}
 $('btnKey').onclick = async () => {
   const v = $('keyInput').value.trim();
   if (!v) return;
@@ -325,7 +338,7 @@ $('btnKey').onclick = async () => {
     $('keyErr').hidden = true;
     $('keyVeil').classList.remove('on');
     start();
-  } catch (e) { $('keyErr').hidden = false; }
+  } catch (e) { $('keyErr').textContent = e.message || '密钥不正确，请重试。'; $('keyErr').hidden = false; }
 };
 $('keyInput').addEventListener('keydown', e => { if (e.key === 'Enter') $('btnKey').click(); });
 
@@ -978,6 +991,10 @@ $('btnLogPin').onclick = () => {
 const CFG_MAP = {
   listen: ['listen'], api_key: ['api_key'],
   package_detail_limit: ['panel', 'package_detail_limit'],
+  login_lockout_enabled: ['security', 'login_lockout', 'enabled'],
+  login_lockout_max_fails: ['security', 'login_lockout', 'max_fails'],
+  login_lockout_window: ['security', 'login_lockout', 'window'],
+  login_lockout_duration: ['security', 'login_lockout', 'lock_duration'],
   checkin_hours: ['schedule', 'checkin_hours'], checkin_enabled: ['schedule', 'checkin_enabled'], growth_hours: ['schedule', 'growth_hours'], growth_enabled: ['schedule', 'growth_enabled'],
   travel_hours: ['schedule', 'travel_hours'], travel_enabled: ['schedule', 'travel_enabled'],
   activity_hours: ['schedule', 'activity_hours'], activity_enabled: ['schedule', 'activity_enabled'],
@@ -1065,7 +1082,8 @@ function collectConfig() {
    不再等到保存被拒。 */
 const DURATION_RE = /^(\d+(\.\d+)?(ns|us|µs|ms|s|m|h))+$/;
 const DURATION_FIELDS = ['soft_rate', 'soft_rate_max', 'breaker_cooldown', 'breaker_cooldown_max',
-  'degrade_cooldown', 'degrade_cooldown_max', 'cost_explore_interval', 'expiring_soon', 'ttl'];
+  'degrade_cooldown', 'degrade_cooldown_max', 'cost_explore_interval', 'expiring_soon', 'ttl',
+  'login_lockout_window', 'login_lockout_duration'];
 const DURATION_TIP = '格式应为 Go 时长：30m / 2h / 600s / 1h30m';
 function durationBad(name) {
   const el = $('cfgForm').elements[name];
@@ -2960,28 +2978,66 @@ async function loadKeys() {
 }
 
 // renderKeyUIDPicker 绑定账号勾选列表（数据来自账号池快照）。
+// 每行 = 昵称 + uid8 +（已禁用）+ 域标签；选中行整行高亮（.on），列表限高滚动。
 function renderKeyUIDPicker(selected) {
   const accounts = (overviewData && overviewData.accounts) || [];
   const sel = new Set(selected || []);
   const box = $('keyUids');
   if (!box) return;
-  if (!accounts.length) { box.innerHTML = '<div class="note">池里还没有账号</div>'; return; }
-  box.innerHTML = accounts.map(a =>
-    '<label><input type="checkbox" value="' + esc(a.uid) + '"' + (sel.has(a.uid) ? ' checked' : '') + '>' +
-    esc((a.nickname || '未命名') + '(' + a.uid.slice(0, 8) + ')') +
-    '<span class="note">' + esc(a.realm === 'global' ? 'global' : 'cn') +
-    (a.disabled ? ' · 已禁用' : '') + '</span></label>'
-  ).join('');
+  if (!accounts.length) {
+    box.innerHTML = '<div class="empty">池里还没有账号，先在「账号池」添加</div>';
+    syncKeyUIDCount();
+    return;
+  }
+  box.innerHTML = accounts.map(a => {
+    const on = sel.has(a.uid);
+    const realm = a.realm === 'global' ? 'global' : 'cn';
+    return '<label class="' + (on ? 'on' : '') + '">' +
+      '<input type="checkbox" value="' + esc(a.uid) + '"' + (on ? ' checked' : '') + '>' +
+      '<span class="ku-name">' + esc(a.nickname || '未命名') + '</span>' +
+      '<span class="ku-uid">' + esc(a.uid.slice(0, 8)) + '</span>' +
+      (a.disabled ? '<span class="tag mute">已禁用</span>' : '') +
+      '<span class="tag mute ku-realm">' + esc(realm) + '</span>' +
+      '</label>';
+  }).join('');
+  syncKeyUIDCount();
+}
+
+// syncKeyUIDCount 刷新「已选 N / 共 M」提示；一个没选时直接说清后果（该密钥不可用）。
+function syncKeyUIDCount() {
+  const box = $('keyUids'), el = $('keyUidsCount');
+  if (!box || !el) return;
+  const boxes = Array.from(box.querySelectorAll('input[type=checkbox]'));
+  const n = boxes.filter(i => i.checked).length;
+  if (!boxes.length) { el.textContent = ''; el.className = 'note'; return; }
+  el.textContent = n ? '已选 ' + n + ' / ' + boxes.length : '未选账号 → 该密钥不可用';
+  el.className = n ? 'note' : 'bad';
+}
+
+// syncKeyModeUI 模式切换：全局池不需要勾账号，绑定模式才展开勾选区与说明。
+function syncKeyModeUI() {
+  const bound = $('keyMode').value === 'bound';
+  $('keyUidsWrap').hidden = !bound;
+  $('keyModeHint').textContent = bound
+    ? '只使用勾选的账号；全部不可用时直接 503'
+    : '与根密钥一样在全局池里选号';
+  // 账号列表来自 overview 快照（5s 轮询）：页面刚打开就点「新建密钥」时快照可能还没有，
+  // 此时会误显示"池里还没有账号"。补拉一次并重画（快照到了就不再触发）。
+  if (bound && !overviewData) {
+    loadOverview(true).then(() => { if ($('keyMode').value === 'bound') renderKeyUIDPicker(); });
+  }
 }
 
 function openKeyCreate() {
   keyEditID = null;
   $('keyDlgTitle').textContent = '新建密钥';
   $('keyName').value = '';
-  $('keyMode').value = 'global';
+  // 默认「绑定账号」：分发密钥的常见用途是给某个人/某个工具用固定账号，
+  // 默认走全局池会让调用方与账号池里所有账号绑定关系不清（想放开再切全局池）。
+  $('keyMode').value = 'bound';
   $('keyExpires').value = '';
   $('keyEnabled').checked = true;
-  $('keyUidsWrap').hidden = true;
+  syncKeyModeUI();
   renderKeyUIDPicker();
   $('keyCreateVeil').classList.add('on');
   setTimeout(() => $('keyName').focus(), 60);
@@ -3012,7 +3068,25 @@ function showKeyPlain(plain) {
 
 if ($('btnKeyCreate')) $('btnKeyCreate').onclick = openKeyCreate;
 if ($('btnKeysRefresh')) $('btnKeysRefresh').onclick = loadKeys;
-if ($('keyMode')) $('keyMode').onchange = () => { $('keyUidsWrap').hidden = $('keyMode').value !== 'bound'; };
+if ($('keyMode')) $('keyMode').onchange = syncKeyModeUI;
+// 勾选态用事件委托：行会随账号池快照整体重渲染，逐行绑事件会随重渲染失效。
+if ($('keyUids')) $('keyUids').addEventListener('change', ev => {
+  const cb = ev.target.closest('input[type=checkbox]');
+  if (!cb) return;
+  cb.closest('label').classList.toggle('on', cb.checked);
+  syncKeyUIDCount();
+});
+function setAllKeyUids(on) {
+  const box = $('keyUids');
+  if (!box) return;
+  box.querySelectorAll('input[type=checkbox]').forEach(cb => {
+    cb.checked = on;
+    cb.closest('label').classList.toggle('on', on);
+  });
+  syncKeyUIDCount();
+}
+if ($('btnKeyUidsAll')) $('btnKeyUidsAll').onclick = () => setAllKeyUids(true);
+if ($('btnKeyUidsNone')) $('btnKeyUidsNone').onclick = () => setAllKeyUids(false);
 if ($('btnKeyCancel')) $('btnKeyCancel').onclick = () => $('keyCreateVeil').classList.remove('on');
 if ($('keySaved')) $('keySaved').onchange = () => { $('btnKeyPlainClose').disabled = !$('keySaved').checked; };
 if ($('btnKeyCopy')) $('btnKeyCopy').onclick = async () => {
@@ -3027,6 +3101,12 @@ if ($('btnKeyPlainClose')) $('btnKeyPlainClose').onclick = () => {
 if ($('btnKeySave')) $('btnKeySave').onclick = async () => {
   const payload = keyFormPayload();
   const editing = keyEditID;
+  // 新建绑定密钥却没勾账号 = 生成一把永远 503 的密钥（编辑不拦：池快照里可能没有
+  // 历史绑定的账号，此时勾选区本来就是空的，拦下来会连改个名字都做不到）。
+  if (!editing && payload.mode === 'bound' && !payload.uids.length) {
+    toast('请至少勾选一个可用账号（或把模式切到全局池）', 'err');
+    return;
+  }
   try {
     const d = editing
       ? await api('keys/' + encodeURIComponent(editing) + '/update', { method: 'POST', body: JSON.stringify(payload) })
@@ -3052,7 +3132,7 @@ if ($('keysBody')) $('keysBody').addEventListener('click', async ev => {
     // datetime-local 需要本地时区的 yyyy-MM-ddTHH:mm；helper 就是干这个的。
     $('keyExpires').value = k.expires_at ? dtLocalValue(new Date(k.expires_at * 1000)) : '';
     $('keyEnabled').checked = !!k.enabled;
-    $('keyUidsWrap').hidden = k.mode !== 'bound';
+    syncKeyModeUI();
     renderKeyUIDPicker(k.uids);
     $('keyCreateVeil').classList.add('on');
     return;

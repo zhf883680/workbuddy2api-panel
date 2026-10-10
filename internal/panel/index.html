@@ -271,6 +271,12 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
   display: inline-flex; align-items: center; gap: 5px; padding: 1px 9px;
   border-radius: 999px; font-size: 11.5px; font-weight: 500; white-space: nowrap;
 }
+/* 语义文本色工具类：表格单元格与弹窗提示直接裸用（此前 .good/.bad/.muted
+   只有 .tag/.stat 等前缀形态，裸用没有颜色——密钥页的「启用中 / 已禁用」就是裸用的）。 */
+.good { color: var(--ok); }
+.warn { color: var(--warn); }
+.bad { color: var(--bad); }
+.muted { color: var(--ink-3); }
 .tag.ok { background: var(--ok-soft); color: var(--ok); }
 .tag.warn { background: var(--warn-soft); color: var(--warn); }
 .tag.bad { background: var(--bad-soft); color: var(--bad); }
@@ -337,6 +343,31 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 .dlg .tabs { display: inline-flex; gap: 2px; background: var(--surface-2); border-radius: 9px; padding: 3px; margin-left: 10px; vertical-align: middle; }
 .dlg .tabs .tab { padding: 4px 14px; border-radius: 7px; border: none; background: transparent; color: var(--ink-3); font: 550 12.5px var(--sans); cursor: pointer; }
 .dlg .tabs .tab.on { background: var(--surface); color: var(--ink); box-shadow: 0 1px 3px rgba(0,0,0,.25); }
+/* 原生日期控件的弹层要跟随明暗主题，否则深色下弹出一块刺眼的白。 */
+.dlg input[type=datetime-local] { color-scheme: light; font-family: var(--mono); font-size: 13px; }
+[data-theme="dark"] .dlg input[type=datetime-local] { color-scheme: dark; }
+
+/* ── 分发密钥弹窗：绑定账号勾选区 ───────────────────────────────────
+   列表限高滚动（账号多时弹窗不跟着变长、不会把底部按钮顶出屏幕）、
+   行内是「昵称 + uid8 + 状态/域标签」，选中行整行高亮 + 勾选态高亮。 */
+/* 密钥页底部操作条：主操作（新建密钥）放在列表末尾——列表长了不用回到页面顶部，
+   与表头右侧只读的「刷新」形成"读在上、写在下"的分工。 */
+.kfoot { display: flex; align-items: center; gap: 10px; margin-top: 14px; }
+.kfoot .grow { flex: 1; }
+.kfoot .note { color: var(--ink-3); font-size: 12px; }
+
+.khead { display: flex; align-items: center; gap: 8px; margin: 0 0 7px; }
+.khead .lb { font-size: 12.5px; color: var(--ink-2); }
+.khead .grow { flex: 1; }
+.khead .note { color: var(--ink-3); font-size: 12px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.keyuids { display: grid; gap: 2px; max-height: 226px; overflow: auto; padding: 6px; background: var(--surface-2); border: 1px solid var(--line-soft); border-radius: 10px; }
+.keyuids label { display: flex; align-items: center; gap: 9px; padding: 7px 9px; border-radius: 7px; font-size: 12.5px; cursor: pointer; }
+.keyuids label:hover { background: var(--raise); }
+.keyuids label.on { background: var(--accent-soft); }
+.keyuids .ku-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.keyuids .ku-uid { flex: none; font: 11px var(--mono); color: var(--ink-3); }
+.keyuids .ku-realm { margin-left: auto; flex: none; }
+.keyuids .empty { padding: 10px; color: var(--ink-3); font-size: 12.5px; }
 .tab-panel + .tab-panel { border-top: 1px solid var(--line-soft); margin: 0 -20px; padding: 14px 20px 0; }
 .url {
   background: var(--surface-2); border: 1px solid var(--line); border-radius: 8px;
@@ -558,11 +589,6 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
   .vtabs button.on { background: var(--surface); color: var(--ink); box-shadow: 0 1px 3px rgba(0,0,0,.22); }
   .vtabs .cnt { color: var(--ink-3); font-weight: 400; margin-left: 4px; font-variant-numeric: tabular-nums; }
   .vtabs button.on .cnt { color: var(--ink-2); }
-
-  /* ── 分发密钥（绑定账号勾选区）──────────────────────────────────── */
-  .keyuids { display: grid; gap: 4px; max-height: 240px; overflow: auto; padding: 8px 10px; background: var(--surface-2); border-radius: 8px; }
-  .keyuids label { display: flex; align-items: center; gap: 8px; font-size: 12.5px; }
-  .keyuids .note { margin-left: auto; }
 
   /* ── 请求记录表（运行日志）────────────────────────────────────────── */
   .acc.req { min-width: 1080px; }
@@ -832,7 +858,6 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <span class="grow"></span>
           <span class="note" id="keysNote">—</span>
           <button class="xs" id="btnKeysRefresh">刷新</button>
-          <button class="primary xs" id="btnKeyCreate">新建密钥</button>
         </header>
         <div class="pad">
           <p class="note" id="keysHint">
@@ -848,6 +873,11 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
               </tr></thead>
               <tbody id="keysBody"></tbody>
             </table>
+          </div>
+          <div class="kfoot">
+            <span class="note">密钥明文只在创建 / 重置时显示一次</span>
+            <span class="grow"></span>
+            <button class="primary" id="btnKeyCreate">新建密钥</button>
           </div>
         </div>
       </div>
@@ -944,6 +974,26 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
             <label class="fld"><span class="lb">单账号明细默认展示条数</span>
               <input name="package_detail_limit" type="number" min="1" placeholder="5">
               <span class="hint">积分构成页按最早到期展示，其余未用完包聚合</span></label>
+          </div>
+        </div>
+
+        <div class="box">
+          <header><h3>安全</h3></header>
+          <div class="pad">
+            <div class="switch"><span class="lb">登录失败锁定</span>
+              <input type="checkbox" name="login_lockout_enabled"></div>
+            <div class="grid3">
+              <label class="fld"><span class="lb">失败次数阈值</span>
+                <input name="login_lockout_max_fails" type="number" min="1" placeholder="5">
+                <span class="hint">同一来源在窗口内失败达到该次数即锁定</span></label>
+              <label class="fld"><span class="lb">失败计数窗口</span>
+                <input name="login_lockout_window" placeholder="5m">
+                <span class="hint">Go 时长：5m / 300s</span></label>
+              <label class="fld"><span class="lb">锁定时长</span>
+                <input name="login_lockout_duration" placeholder="10m">
+                <span class="hint">锁定期内一律 429，到期自动解锁</span></label>
+            </div>
+            <div class="hint">鉴权失败按来源 IP（代理后取 <code>X-Forwarded-For</code> 首段）累计：覆盖面板密钥门、<code>/status</code> 与 <code>/v1</code> —— 它们共用同一个 api_key。锁定期内正确密钥同样被拒（针对来源的硬锁），状态在内存中，重启进程即清空（误锁的兜底解锁手段）。</div>
           </div>
         </div>
 
@@ -1273,25 +1323,42 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 </div>
 
 <!-- 密钥 -->
-<div class="veil" id="keyCreateVeil">
-  <div class="dlg" style="width:560px">
-    <h3 id="keyDlgTitle">新建密钥</h3>
-    <div class="pad">
-      <label>名称<input id="keyName" maxlength="32" placeholder="如 张三"></label>
-      <label>模式
-        <select id="keyMode">
-          <option value="global">全局池（与根密钥一样走全局选号）</option>
-          <option value="bound">绑定账号（只用勾选的账号）</option>
-        </select>
-      </label>
-      <label>过期时间（留空 = 永不过期）<input type="datetime-local" id="keyExpires"></label>
-      <div id="keyUidsWrap" hidden>
-        <div class="note">勾选该密钥可使用的账号（严格模式：全部不可用时报 503，不借用其他账号）</div>
-        <div id="keyUids" class="keyuids"></div>
+<div class="veil" id="keyCreateVeil" data-lock="1">
+  <div class="dlg" style="width:600px">
+    <header>
+      <h3 id="keyDlgTitle">新建密钥</h3>
+      <div class="hint">明文只在创建 / 重置时显示一次；管理面（面板与 <code>/status</code>）不向分发密钥开放。</div>
+    </header>
+    <div class="body">
+      <label class="fld"><span class="lb">名称</span>
+        <input id="keyName" maxlength="32" placeholder="如 张三"></label>
+      <div class="grid2">
+        <label class="fld"><span class="lb">模式</span>
+          <select id="keyMode">
+            <option value="bound">绑定账号（只用勾选的账号）</option>
+            <option value="global">全局池（走全局选号）</option>
+          </select>
+          <span class="hint" id="keyModeHint"></span></label>
+        <label class="fld"><span class="lb">过期时间</span>
+          <input type="datetime-local" id="keyExpires">
+          <span class="hint">留空 = 永不过期</span></label>
       </div>
-      <label class="row inline"><input type="checkbox" id="keyEnabled" checked> 启用</label>
+      <div id="keyUidsWrap" hidden>
+        <div class="khead">
+          <span class="lb">可用账号</span>
+          <span class="grow"></span>
+          <span class="note" id="keyUidsCount"></span>
+          <button type="button" class="xs" id="btnKeyUidsAll">全选</button>
+          <button type="button" class="xs" id="btnKeyUidsNone">清空</button>
+        </div>
+        <div id="keyUids" class="keyuids"></div>
+        <div class="hint">严格模式：该密钥只使用勾选的账号，全部不可用时直接 503，绝不借用其他账号。</div>
+      </div>
+      <div class="switch" style="margin-top:6px"><span class="lb">启用</span>
+        <input type="checkbox" id="keyEnabled" checked></div>
     </div>
     <footer>
+      <span class="grow"></span>
       <button id="btnKeyCancel">取消</button>
       <button class="primary" id="btnKeySave">保存</button>
     </footer>
@@ -1314,7 +1381,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
   <div class="dlg" style="width:420px">
     <header>
       <h3>需要访问密钥</h3>
-      <div class="hint">该网关已启用 api_key 鉴权，请输入 config.json 中的密钥。</div>
+      <div class="hint">该网关已启用 api_key 鉴权，请输入 config.json 中的密钥。连续输错会被临时锁定（见 config 的 security.login_lockout）。</div>
     </header>
     <div class="body">
       <form style="display:contents" onsubmit="return false"><input type="password" id="keyInput" placeholder="api_key" autocomplete="off"></form>
