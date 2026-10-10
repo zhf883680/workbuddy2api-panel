@@ -338,12 +338,13 @@ let lastPackagesAt = 0;
 let expFetching = false;                       // 到期卡片在途标记（防重复打上游）
 const EXP_FRESH_MS = 2 * 60 * 1000;            // 缓存新鲜窗口：2 分钟内复用
 
-const TITLES = { accounts: '账号池', usage: '用量', packages: '积分构成', taskscenter: '任务中心', models: '模型与档位', config: '配置', logs: '运行日志' };
+const TITLES = { accounts: '账号池', keys: '密钥', usage: '用量', packages: '积分构成', taskscenter: '任务中心', models: '模型与档位', config: '配置', logs: '运行日志' };
 function go(v) {
   view = v;
   document.querySelectorAll('.view').forEach(s => s.hidden = s.id !== 'view-' + v);
   document.querySelectorAll('.nav a').forEach(a => a.classList.toggle('on', a.dataset.view === v));
   $('ttl').textContent = TITLES[v];
+  if (v === 'keys') loadKeys();
   if (v === 'models' && !$('mdBody').children.length) loadModels();
   if (v === 'config') loadConfig();
   if (v === 'logs') loadLogs();
@@ -2890,3 +2891,186 @@ if ($('btnExp')) $('btnExp').onclick = () => loadExpiry(true);
 
 // 「刷新」始终实时查（显式 force，不依赖事件对象真值）
 if ($('btnPk')) $('btnPk').onclick = () => loadPackages(true);
+
+/* ── 分发密钥 ─────────────────────────────────────────────────────── */
+let keysCache = [];
+let keyEditID = null;
+let keyPlainValue = '';
+
+// keyStatus 密钥状态标签：禁用优先于过期（禁用是人为动作，先看它）。
+function keyStatus(k) {
+  if (!k.enabled) return '<span class="bad">已禁用</span>';
+  if (k.expires_at && k.expires_at * 1000 < Date.now()) return '<span class="bad">已过期</span>';
+  return '<span class="good">启用中</span>';
+}
+
+// fmtKeyUIDs 绑定账号列：显示「昵称(uid8)」，池里已不存在的标红为"账号不存在"。
+function fmtKeyUIDs(k, accounts) {
+  if (k.mode !== 'bound') return '<span class="muted">走全局池</span>';
+  if (!k.uids || !k.uids.length) return '<span class="bad">未绑定任何账号（该密钥不可用）</span>';
+  let missing = 0;
+  const parts = k.uids.map(u => {
+    const a = (accounts || []).find(x => x.uid === u);
+    if (!a) { missing++; return '<span class="bad" title="账号不存在：' + esc(u) + '">' + esc(u.slice(0, 8)) + '(不存在)</span>'; }
+    return esc((a.nickname || '未命名') + '(' + u.slice(0, 8) + ')');
+  });
+  return parts.join('、') + (missing ? ' <span class="note">共 ' + missing + ' 个失效绑定</span>' : '');
+}
+
+function renderKeys() {
+  const accounts = (overviewData && overviewData.accounts) || [];
+  const tb = $('keysBody');
+  if (!tb) return;
+  if (!keysCache.length) {
+    tb.innerHTML = '<tr><td colspan="11" class="empty">还没有分发密钥，点右上角「新建密钥」</td></tr>';
+    return;
+  }
+  tb.innerHTML = keysCache.map(k => {
+    const u = k.usage || {};
+    const toks = Number(u.prompt_tokens || 0) + Number(u.completion_tokens || 0);
+    return '<tr>' +
+      '<td>' + esc(k.name) + '</td>' +
+      '<td><code>' + esc(k.prefix) + '</code></td>' +
+      '<td>' + (k.mode === 'bound' ? '绑定账号' : '全局池') + '</td>' +
+      '<td>' + fmtKeyUIDs(k, accounts) + '</td>' +
+      '<td>' + keyStatus(k) + '</td>' +
+      '<td class="num">' + Number(u.req || 0) + '</td>' +
+      '<td class="num">' + Number(u.err || 0) + '</td>' +
+      '<td class="num">' + fmtK(toks) + '</td>' +
+      '<td>' + (k.last_used_at ? ago(new Date(k.last_used_at * 1000).toISOString()) : '—') + '</td>' +
+      '<td>' + (k.expires_at ? fmtLocalDateTime(k.expires_at * 1000) : '永不过期') + '</td>' +
+      '<td class="row">' +
+        '<button class="xs" data-k="' + esc(k.id) + '" data-a="edit">编辑</button>' +
+        '<button class="xs" data-k="' + esc(k.id) + '" data-a="toggle">' + (k.enabled ? '禁用' : '启用') + '</button>' +
+        '<button class="xs" data-k="' + esc(k.id) + '" data-a="rotate">重置密钥</button>' +
+        '<button class="xs danger" data-k="' + esc(k.id) + '" data-a="remove">删除</button>' +
+      '</td></tr>';
+  }).join('');
+}
+
+async function loadKeys() {
+  try {
+    const d = await api('keys');
+    keysCache = d.keys || [];
+    // 绑定账号列要显示昵称：没有账号快照时顺带拉一次（quiet = 失败不弹 toast）。
+    if (!overviewData) await loadOverview(true);
+    renderKeys();
+    $('keysNote').textContent = keysCache.length ? keysCache.length + ' 把密钥' : '';
+  } catch (e) { toast(e.message, 'err'); }
+}
+
+// renderKeyUIDPicker 绑定账号勾选列表（数据来自账号池快照）。
+function renderKeyUIDPicker(selected) {
+  const accounts = (overviewData && overviewData.accounts) || [];
+  const sel = new Set(selected || []);
+  const box = $('keyUids');
+  if (!box) return;
+  if (!accounts.length) { box.innerHTML = '<div class="note">池里还没有账号</div>'; return; }
+  box.innerHTML = accounts.map(a =>
+    '<label><input type="checkbox" value="' + esc(a.uid) + '"' + (sel.has(a.uid) ? ' checked' : '') + '>' +
+    esc((a.nickname || '未命名') + '(' + a.uid.slice(0, 8) + ')') +
+    '<span class="note">' + esc(a.realm === 'global' ? 'global' : 'cn') +
+    (a.disabled ? ' · 已禁用' : '') + '</span></label>'
+  ).join('');
+}
+
+function openKeyCreate() {
+  keyEditID = null;
+  $('keyDlgTitle').textContent = '新建密钥';
+  $('keyName').value = '';
+  $('keyMode').value = 'global';
+  $('keyExpires').value = '';
+  $('keyEnabled').checked = true;
+  $('keyUidsWrap').hidden = true;
+  renderKeyUIDPicker();
+  $('keyCreateVeil').classList.add('on');
+  setTimeout(() => $('keyName').focus(), 60);
+}
+
+function keyFormPayload() {
+  const mode = $('keyMode').value;
+  const uids = mode === 'bound'
+    ? Array.from($('keyUids').querySelectorAll('input[type=checkbox]:checked')).map(i => i.value)
+    : [];
+  const expRaw = $('keyExpires').value;
+  return {
+    name: $('keyName').value,
+    mode: mode,
+    uids: uids,
+    expires_at: expRaw ? Math.floor(new Date(expRaw).getTime() / 1000) : 0,
+    enabled: $('keyEnabled').checked,
+  };
+}
+
+function showKeyPlain(plain) {
+  keyPlainValue = plain;
+  $('keyPlain').textContent = plain;
+  $('keySaved').checked = false;
+  $('btnKeyPlainClose').disabled = true;
+  $('keyPlainVeil').classList.add('on');
+}
+
+if ($('btnKeyCreate')) $('btnKeyCreate').onclick = openKeyCreate;
+if ($('btnKeysRefresh')) $('btnKeysRefresh').onclick = loadKeys;
+if ($('keyMode')) $('keyMode').onchange = () => { $('keyUidsWrap').hidden = $('keyMode').value !== 'bound'; };
+if ($('btnKeyCancel')) $('btnKeyCancel').onclick = () => $('keyCreateVeil').classList.remove('on');
+if ($('keySaved')) $('keySaved').onchange = () => { $('btnKeyPlainClose').disabled = !$('keySaved').checked; };
+if ($('btnKeyCopy')) $('btnKeyCopy').onclick = async () => {
+  try { await navigator.clipboard.writeText(keyPlainValue); toast('已复制', 'ok'); }
+  catch (e) { toast('复制失败，请手动选择文本', 'err'); }
+};
+if ($('btnKeyPlainClose')) $('btnKeyPlainClose').onclick = () => {
+  keyPlainValue = '';
+  $('keyPlain').textContent = '';
+  $('keyPlainVeil').classList.remove('on');
+};
+if ($('btnKeySave')) $('btnKeySave').onclick = async () => {
+  const payload = keyFormPayload();
+  const editing = keyEditID;
+  try {
+    const d = editing
+      ? await api('keys/' + encodeURIComponent(editing) + '/update', { method: 'POST', body: JSON.stringify(payload) })
+      : await api('keys', { method: 'POST', body: JSON.stringify(payload) });
+    $('keyCreateVeil').classList.remove('on');
+    await loadKeys();
+    if (d.plaintext) showKeyPlain(d.plaintext);
+    toast(editing ? '密钥已更新' : '密钥已创建', 'ok');
+  } catch (e) { toast(e.message, 'err'); }
+};
+
+if ($('keysBody')) $('keysBody').addEventListener('click', async ev => {
+  const b = ev.target.closest('button[data-k]');
+  if (!b) return;
+  const id = b.dataset.k, action = b.dataset.a;
+  const k = keysCache.find(x => x.id === id);
+  if (!k) return;
+  if (action === 'edit') {
+    keyEditID = id;
+    $('keyDlgTitle').textContent = '编辑密钥 · ' + k.name;
+    $('keyName').value = k.name;
+    $('keyMode').value = k.mode;
+    // datetime-local 需要本地时区的 yyyy-MM-ddTHH:mm；helper 就是干这个的。
+    $('keyExpires').value = k.expires_at ? dtLocalValue(new Date(k.expires_at * 1000)) : '';
+    $('keyEnabled').checked = !!k.enabled;
+    $('keyUidsWrap').hidden = k.mode !== 'bound';
+    renderKeyUIDPicker(k.uids);
+    $('keyCreateVeil').classList.add('on');
+    return;
+  }
+  if (action === 'remove' && !confirm('删除后使用这把密钥的调用方会立即 401，且不可恢复。确认删除？')) return;
+  if (action === 'rotate' && !confirm('重置后旧密钥立即失效，需要把新密钥重新发给调用方。确认重置？')) return;
+  b.disabled = true;
+  try {
+    if (action === 'toggle') {
+      await api('keys/' + encodeURIComponent(id) + '/update', { method: 'POST', body: JSON.stringify({ enabled: !k.enabled }) });
+      toast(k.enabled ? '已禁用' : '已启用', 'ok');
+    } else if (action === 'rotate') {
+      const d = await api('keys/' + encodeURIComponent(id) + '/rotate', { method: 'POST' });
+      showKeyPlain(d.plaintext);
+    } else if (action === 'remove') {
+      await api('keys/' + encodeURIComponent(id) + '/remove', { method: 'POST' });
+      toast('已删除', 'ok');
+    }
+    await loadKeys();
+  } catch (e) { toast(e.message, 'err'); } finally { b.disabled = false; }
+});

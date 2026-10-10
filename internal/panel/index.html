@@ -559,6 +559,11 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
   .vtabs .cnt { color: var(--ink-3); font-weight: 400; margin-left: 4px; font-variant-numeric: tabular-nums; }
   .vtabs button.on .cnt { color: var(--ink-2); }
 
+  /* ── 分发密钥（绑定账号勾选区）──────────────────────────────────── */
+  .keyuids { display: grid; gap: 4px; max-height: 240px; overflow: auto; padding: 8px 10px; background: var(--surface-2); border-radius: 8px; }
+  .keyuids label { display: flex; align-items: center; gap: 8px; font-size: 12.5px; }
+  .keyuids .note { margin-left: auto; }
+
   /* ── 请求记录表（运行日志）────────────────────────────────────────── */
   .acc.req { min-width: 1080px; }
   .acc.req th, .acc.req td { padding: 8px 10px; }
@@ -608,6 +613,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       <li><a href="#taskscenter" data-view="taskscenter">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M3 2.5h10v9H8l-3 3v-3H3z"/><path d="M6 6.5h4M6 9h2.5"/></svg>
         任务中心</a></li>
+      <li><a href="#keys" data-view="keys">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="5.5" cy="8" r="2.5"/><path d="M8 8h6M11.5 8v2.2M13.5 8v1.6"/></svg>
+        密钥</a></li>
       <li><a href="#models" data-view="models">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M8 1.8 14 5v6L8 14.2 2 11V5z"/><path d="M2 5l6 3.2L14 5M8 8.2v6"/></svg>
         模型与档位</a></li>
@@ -816,6 +824,35 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
     </section>
 
     <!-- 用量 -->
+    <!-- 分发密钥 -->
+    <section class="view" id="view-keys" hidden>
+      <div class="box">
+        <header>
+          <h3>分发密钥</h3>
+          <span class="grow"></span>
+          <span class="note" id="keysNote">—</span>
+          <button class="xs" id="btnKeysRefresh">刷新</button>
+          <button class="primary xs" id="btnKeyCreate">新建密钥</button>
+        </header>
+        <div class="pad">
+          <p class="note" id="keysHint">
+            绑定模式：该密钥只使用勾选的账号，全部不可用时直接 503，绝不借用其他账号；全局池模式：与根密钥一样走全局选号。
+            密钥明文只在创建/重置时显示一次，请立即保存。
+          </p>
+          <div class="tbl-wrap">
+            <table class="acc">
+              <thead><tr>
+                <th>名称</th><th>密钥</th><th>模式</th><th>绑定账号</th><th>状态</th>
+                <th class="num">调用</th><th class="num">失败</th><th class="num">Token</th>
+                <th>最后使用</th><th>过期</th><th></th>
+              </tr></thead>
+              <tbody id="keysBody"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </section>
+
     <section class="view" id="view-usage" hidden>
       <div class="box">
         <header>
@@ -1236,6 +1273,43 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 </div>
 
 <!-- 密钥 -->
+<div class="veil" id="keyCreateVeil">
+  <div class="dlg" style="width:560px">
+    <h3 id="keyDlgTitle">新建密钥</h3>
+    <div class="pad">
+      <label>名称<input id="keyName" maxlength="32" placeholder="如 张三"></label>
+      <label>模式
+        <select id="keyMode">
+          <option value="global">全局池（与根密钥一样走全局选号）</option>
+          <option value="bound">绑定账号（只用勾选的账号）</option>
+        </select>
+      </label>
+      <label>过期时间（留空 = 永不过期）<input type="datetime-local" id="keyExpires"></label>
+      <div id="keyUidsWrap" hidden>
+        <div class="note">勾选该密钥可使用的账号（严格模式：全部不可用时报 503，不借用其他账号）</div>
+        <div id="keyUids" class="keyuids"></div>
+      </div>
+      <label class="row inline"><input type="checkbox" id="keyEnabled" checked> 启用</label>
+    </div>
+    <footer>
+      <button id="btnKeyCancel">取消</button>
+      <button class="primary" id="btnKeySave">保存</button>
+    </footer>
+  </div>
+</div>
+
+<div class="veil" id="keyPlainVeil" data-lock="1">
+  <div class="dlg" style="width:520px">
+    <h3>密钥明文（只显示这一次）</h3>
+    <div class="pad">
+      <p class="note">关闭后无法再查看。若丢失只能「重置密钥」——重置会让旧密钥立即失效。</p>
+      <code id="keyPlain" style="display:block;word-break:break-all;font-size:13px;padding:10px;background:var(--surface-2);border-radius:8px"></code>
+      <label class="row inline" style="margin-top:10px"><input type="checkbox" id="keySaved"> 我已保存该密钥</label>
+    </div>
+    <footer><button id="btnKeyCopy">复制</button><button class="primary" id="btnKeyPlainClose" disabled>完成</button></footer>
+  </div>
+</div>
+
 <div class="veil" id="keyVeil" data-lock="1">
   <div class="dlg" style="width:420px">
     <header>
