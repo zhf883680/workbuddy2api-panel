@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/keystore"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/panel"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
@@ -238,6 +239,21 @@ func main() {
 		SanitizeFingerprints: cfg.Features.SanitizeBlacklistFingerprints,
 		RecordClientInfo:     cfg.Logging.RequestClientInfo,
 	})
+	// 分发密钥存储（keys.json）：默认与 state/usage/request-logs 同目录，随
+	// state_file 一起搬移（keys_file 显式配置可覆盖）。单一实例同时注入 server 与
+	// panel，保证面板刚签发的密钥下一个请求就生效，不存在两份内存状态。
+	keysPath := cfg.KeysFile
+	if keysPath == "" {
+		keysPath = stateSibling(cfg.StateFile, "keys.json")
+	}
+	keys, err := keystore.New(keysPath)
+	if err != nil {
+		log.Fatalf("加载密钥文件失败: %v", err)
+	}
+	keys.Start()
+	defer keys.Stop()
+	log.Printf("[keystore] 分发密钥已启用: %s（%d 把）", keysPath, len(keys.List()))
+
 	// 用量记录器：与 state 文件同目录，随 state_file 配置一起搬移。
 	// datapath 由 state 文件路径推出，避免再加一个配置项。
 	usagePath := usagePathFor(cfg.StateFile)
@@ -264,6 +280,7 @@ func main() {
 
 	pn := panel.New(panel.Config{
 		Pool:        p,
+		Keys:        keys,
 		Usage:       rec,
 		RequestLog:  requestLog,
 		Upstream:    up,
@@ -295,6 +312,7 @@ func main() {
 		Pool:         p,
 		Upstream:     up,
 		APIKey:       cfg.APIKey,
+		Keys:         keys,
 		Session:      sessRouter,
 		StickyCount:  sessCount,
 		RedisMode:    redisMode,
