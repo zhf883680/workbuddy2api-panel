@@ -4,11 +4,19 @@ services:
     container_name: workbuddy2api
     restart: unless-stopped
     # 容器默认以 app 用户（uid 10001）运行。宿主机挂载目录属主不同会导致
-    # 「写入 auths/*.json.tmp 失败 permission denied」，三种解法任选：
+    # 「写入 auths/workbuddy*.json.tmp / data/*.json.tmp 失败 permission denied」。
+    #
+    # 注意 ./data 同时承载 state.json（账号池状态）、usage.json（用量）、
+    # keys.json（分发密钥）、model.json（模型缓存）——四者都是「先写 .tmp 再 rename」，
+    # 目录不可写会一起失败；其中部分失败的日志级别较低，容易只表现为「面板建密钥报错」。
+    # 先在容器内自检：docker compose exec wb2api sh -c 'touch /app/data/.p && rm /app/data/.p && echo OK'
+    #
+    # 三种解法任选：
     #   1) 非 root · 让容器以你自己的 uid 运行（挂载目录本来就是你建的）：
     #      PUID=$(id -u) PGID=$(id -g) docker compose up -d
     #      或写进 .env 文件：PUID=1000 / PGID=1000
     #   2) sudo chown -R 10001:10001 ./auths ./data ./config.json
+    #      （./data 若由 Docker 自动创建，属主会是 root:root —— 这是最常见的成因）
     #   3) user: "0:0" 以 root 运行（省事但容器逃逸面更大，自担）
     user: "${PUID:-10001}:${PGID:-10001}"
     environment:
