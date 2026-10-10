@@ -398,10 +398,49 @@ const (
 // models 返回模型列表：纯动态（缓存 10min），失败/无号返回空列表（无静态兜底——
 // 拉不出目录即意味着上游不可用，假名单只会让客户端选到 11102 的模型）。
 func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
+	// 绑定密钥按「绑定账号实际存在的域」过滤模型条目：只绑了 cn 号的密钥不该看到
+	// global: 前缀的模型（那些模型对它必然 503）。根密钥与 global 模式密钥不过滤，
+	// 输出与改动前逐字一致。过滤在响应阶段做，不动 10min 的全局目录缓存。
 	writeJSON(w, http.StatusOK, map[string]any{
 		"object": "list",
-		"data":   h.modelList(),
+		"data":   filterModelsForRealms(h.modelList(), h.boundRealms(identityFrom(r))),
 	})
+}
+
+// filterModelsForRealms 按允许的 realm 集合过滤模型条目（id 形如 "cn:xxx"/"global:xxx"）。
+// allowed 为 nil = 不过滤（根密钥 / global 模式密钥路径）；空集合 = 全部滤掉
+// （绑定账号全部不存在时，该密钥本来就没有可路由的域）。
+func filterModelsForRealms(entries []map[string]any, allowed map[string]bool) []map[string]any {
+	if allowed == nil {
+		return entries
+	}
+	out := make([]map[string]any, 0, len(entries))
+	for _, e := range entries {
+		id, _ := e["id"].(string)
+		realm := "cn" // 无前缀裸名缺省 cn，与 resolveModel 同口径
+		if i := strings.IndexByte(id, ':'); i > 0 && (id[:i] == "cn" || id[:i] == "global") {
+			realm = id[:i]
+		}
+		if allowed[realm] {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// boundRealms 绑定身份可路由的 realm 集合（由绑定账号的实际 Realm() 推导，池里不存在的
+// uid 直接忽略）；非绑定身份（根密钥 / global 模式）返回 nil = 不过滤。
+func (h *Handler) boundRealms(id Identity) map[string]bool {
+	if id.Root || id.Mode != keystore.ModeBound {
+		return nil
+	}
+	out := map[string]bool{}
+	for _, uid := range id.UIDs {
+		if a := h.cfg.Pool.AuthByUID(uid); a != nil {
+			out[a.Realm()] = true
+		}
+	}
+	return out
 }
 
 // fmtCreditsPrefix 从上游 credits 原文提取倍率并格式化为 "[x0.05 credit]"。

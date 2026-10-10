@@ -2068,3 +2068,52 @@ func TestUsageCountedPerKey(t *testing.T) {
 		t.Fatalf("根密钥不该计入分发密钥: %d -> %d", list[0].Usage.Req, got)
 	}
 }
+
+// TestModelsFilteredByBoundRealm bound 密钥只能看到自己绑定域可路由的模型条目
+// （spec §6.6 / AC9）；根密钥与 global 模式密钥不过滤，输出逐字不变。
+func TestModelsFilteredByBoundRealm(t *testing.T) {
+	entries := []map[string]any{{"id": "cn:m1"}, {"id": "global:m2"}}
+	got := filterModelsForRealms(entries, map[string]bool{"global": true})
+	if len(got) != 1 || got[0]["id"] != "global:m2" {
+		t.Fatalf("过滤结果 = %+v", got)
+	}
+	if len(filterModelsForRealms(entries, nil)) != 2 {
+		t.Fatal("realm 集合为 nil 时不得过滤（根密钥/global 密钥路径）")
+	}
+	if len(filterModelsForRealms(entries, map[string]bool{})) != 0 {
+		t.Fatal("空 realm 集合应返回空列表")
+	}
+	if len(filterModelsForRealms(entries, map[string]bool{"cn": true})) != 1 {
+		t.Fatal("cn 集合只应保留 cn 条目")
+	}
+}
+
+// TestBoundRealmsFromPool 绑定身份的可路由域由「绑定账号的实际 Realm」推导；
+// 非绑定身份返回 nil（不过滤）。
+func TestBoundRealmsFromPool(t *testing.T) {
+	p := pool.New("")
+	p.Add(&auth.Auth{UID: "u_cn", Nickname: "cn号"})
+	p.Add(&auth.Auth{UID: "u_gl", Nickname: "gl号", Domain: "workbuddy.ai"})
+	h := NewHandler(Config{Pool: p, Upstream: upstream.New(), APIKey: "root"})
+
+	root := h.boundRealms(Identity{Root: true, Mode: keystore.ModeGlobal})
+	if root != nil {
+		t.Fatalf("根身份不该过滤: %+v", root)
+	}
+	global := h.boundRealms(Identity{KeyID: "k1", Mode: keystore.ModeGlobal})
+	if global != nil {
+		t.Fatalf("global 模式不该过滤: %+v", global)
+	}
+	cnOnly := h.boundRealms(Identity{KeyID: "k1", Mode: keystore.ModeBound, UIDs: []string{"u_cn"}})
+	if len(cnOnly) != 1 || !cnOnly["cn"] {
+		t.Fatalf("cn 绑定域 = %+v", cnOnly)
+	}
+	both := h.boundRealms(Identity{KeyID: "k1", Mode: keystore.ModeBound, UIDs: []string{"u_cn", "u_gl", "u_ghost"}})
+	if len(both) != 2 || !both["cn"] || !both["global"] {
+		t.Fatalf("双域绑定 = %+v", both)
+	}
+	none := h.boundRealms(Identity{KeyID: "k1", Mode: keystore.ModeBound, UIDs: []string{"u_ghost"}})
+	if len(none) != 0 {
+		t.Fatalf("绑定号全部不存在应得到空集合: %+v", none)
+	}
+}
