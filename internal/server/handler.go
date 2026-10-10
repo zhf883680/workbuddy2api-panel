@@ -868,6 +868,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	defer st.done()
 
+	// 调用方身份（经过 withAuth 填写）：决定选号候选集与用量归属。
+	// allowed 非 nil 即"绑定模式"，候选集被限制在绑定账号内，全不可用时 503 而非借号。
+	id := identityFrom(r)
+	allowed := id.AllowedUIDs()
+
 	// models.hidden 黑名单：点名调用直接拒绝，不打上游、不占选号。
 	// 与 /v1/models 的列表过滤对称（只藏列表不够，知道名字仍可硬调）。
 	if h.hiddenModel(realm, bareModel) {
@@ -883,6 +888,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// modelBlock 记录本次是否因「模型级冷却」而选不到号（下方 acct==nil 分支填充）。
 	// 默认零值 Blocked=false = 按既有的"没有可用账号"口径报错。
 	var modelBlock pool.ModelBlockStatus
+	// bindErrMsg 绑定密钥的选择性失败原因（下方 acct==nil 分支填充）；
+	// 非空时优先作为 503 的 message，便于调用方直接看到"是哪个绑定号不行"。
+	var bindErrMsg string
 
 	// 会话粘性：从请求体提取会话键并解析绑定号（找不到/无效则 stickyUID 为空，走普通轮换）。
 	// ExtractKey 与粘性开关解耦（issue #35 侧）：关闭粘性时会话头族的聚合主键仍按
@@ -1082,7 +1090,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	for i := 0; i < h.cfg.MaxRotate; i++ {
 		// 选号：粘性号优先（PickByUIDForModel 已校验该模型可用性 + 在途未满），否则普通轮换。
 		var acct *auth.Auth
-		if stickyUID != "" {
+		if stickyUID != "" && (allowed == nil || allowed[stickyUID]) {
 			acct = h.cfg.Pool.PickByUIDForModel(stickyUID, bareModel)
 			if acct == nil || (realm != "" && acct.Realm() != realm) {
 				// 粘性号在当前模型不可用（冷却/占满/该模型被 6004 限额）或 realm 不符 → 解绑，
@@ -1090,11 +1098,20 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				unbindSticky()
 				acct = nil
 			}
+		} else if stickyUID != "" {
+			// 粘性号不属于本密钥的绑定集合：立即解绑，绝不让请求被带到别人的号上。
+			// 粘性键由请求内容推导、跨密钥共享，缺这道护栏会直接串号。
+			unbindSticky()
 		}
 		if acct == nil {
 			// 模型感知 + realm 感知选号：模型非空时启用 6004 模型级冷却豁免
 			// （healthyForModel），realm 谓词过滤跨域账号。
-			acct = h.cfg.Pool.PickExcludingForRealm(tried, bareModel, realm)
+			// 绑定密钥（allowed 非 nil）走绑定版入口：候选集被限制且兜底同样不外溢。
+			if allowed != nil {
+				acct = h.cfg.Pool.PickExcludingForRealmBound(tried, bareModel, realm, allowed)
+			} else {
+				acct = h.cfg.Pool.PickExcludingForRealm(tried, bareModel, realm)
+			}
 		}
 		if acct == nil {
 			st.status = http.StatusServiceUnavailable
@@ -1105,6 +1122,16 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 在这里取一次快照，供下方错误构造区分；按 realm 统计，否则另一域的
 			// 健康号会把「本域全被模型级冷却挡住」掩盖成还有号可服务。
 			modelBlock = h.cfg.Pool.ModelBlockedForRealm(bareModel, realm)
+			if allowed != nil {
+				uids := append([]string(nil), id.UIDs...)
+				if len(uids) == 0 {
+					bindErrMsg = "该密钥为绑定模式但未配置任何账号"
+				} else if s := pool.SummarizeUnavailable(h.cfg.Pool.ExplainBound(uids, realm, bareModel)); s != "" {
+					bindErrMsg = fmt.Sprintf("绑定账号 %d 个均不可用：%s", len(uids), s)
+				} else {
+					bindErrMsg = fmt.Sprintf("绑定账号 %d 个均不可用", len(uids))
+				}
+			}
 			break
 		}
 		st.uid = acct.UID
@@ -1587,9 +1614,15 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	//
 	// 用 400 而非 503：这是"你选的这个模型当前不可用"，不是"服务端暂时过载"。
 	// 换号重试必然同样失败，客户端不该按可重试错误处理。
-	// 积分耗尽细化（fork 自有）：与上面的 errors.As 分支互斥（无上游原文时才成立），
-	// 且优先于模型级阻塞——池里一个号都试不出来时，「没积分」比「换模型」更准确。
-	if ue == nil && h.cfg.Pool != nil && h.cfg.Pool.AllHardCreditForRealm(realm) {
+	// 绑定密钥的失败明细优先：调用方需要直接知道是哪个绑定账号不可用，
+	// 而不是被全局模型级阻塞快照误导。仍是 503（可重试语义不变）。
+	if bindErrMsg != "" {
+		code = "no_healthy_account"
+		status = http.StatusServiceUnavailable
+		msg = bindErrMsg
+		// 积分耗尽细化（fork 自有）：与上面的 errors.As 分支互斥（无上游原文时才成立），
+		// 且优先于模型级阻塞——池里一个号都试不出来时，「没积分」比「换模型」更准确。
+	} else if ue == nil && h.cfg.Pool != nil && h.cfg.Pool.AllHardCreditForRealm(realm) {
 		// 池里一个可试的号都没有，且挡路的全是余额耗尽冷却：把笼统的「无可用账号」
 		// 细化成积分耗尽语义——客户端对着必然失败的请求重试只是白等。
 		status, quota = http.StatusTooManyRequests, true

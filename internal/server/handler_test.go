@@ -2668,3 +2668,103 @@ func TestDistributionKeyAuthMatrix(t *testing.T) {
 		})
 	}
 }
+
+// TestBoundKeyStrictRouting bound 密钥的严格语义（AC3）：绑定号不可用时必须 503，
+// 即使池里有其他健康账号也绝不借用，且错误消息要带绑定明细。
+func TestBoundKeyStrictRouting(t *testing.T) {
+	ks, err := keystore.New(t.TempDir() + "/keys.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, boundPlain, err := ks.Create(keystore.CreateInput{Name: "绑定A", Mode: keystore.ModeBound, UIDs: []string{"u_a"}, Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := pool.New("")
+	p.Add(&auth.Auth{UID: "u_a", Nickname: "A"})
+	p.Add(&auth.Auth{UID: "u_b", Nickname: "B"}) // 故意保持健康：绑定号不可用时也绝不能借它
+	h := NewHandler(Config{Pool: p, Upstream: upstream.New(), APIKey: "root", Keys: ks, MaxRotate: 1})
+
+	// 1) 绑定号可用：不会因为鉴权被挡（上游不可达导致的失败与本次断言无关）。
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"cn:m","messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("Authorization", "Bearer "+boundPlain)
+	h.ServeHTTP(rec, req)
+	if rec.Code == http.StatusUnauthorized {
+		t.Fatalf("绑定密钥不该被鉴权拒绝: %s", rec.Body.String())
+	}
+
+	// 2) 绑定号暂停 → 池里仍有健康的 u_b，但必须 503 且带绑定明细。
+	p.Pause("u_a")
+	rec2 := httptest.NewRecorder()
+	req2 := httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"cn:m","messages":[{"role":"user","content":"hi"}]}`))
+	req2.Header.Set("Authorization", "Bearer "+boundPlain)
+	h.ServeHTTP(rec2, req2)
+	if rec2.Code != http.StatusServiceUnavailable {
+		t.Fatalf("绑定号不可用应 503，得到 %d (%s)", rec2.Code, rec2.Body.String())
+	}
+	if !strings.Contains(rec2.Body.String(), "绑定账号") {
+		t.Fatalf("503 应带绑定明细，得到 %s", rec2.Body.String())
+	}
+}
+
+// TestGlobalKeyIgnoresBinding bound 之外的密钥（根密钥与 global 模式密钥）选号不受绑定约束。
+func TestGlobalKeyIgnoresBinding(t *testing.T) {
+	ks, _ := keystore.New(t.TempDir() + "/keys.json")
+	_, globalPlain, _ := ks.Create(keystore.CreateInput{Name: "全局", Mode: keystore.ModeGlobal, UIDs: []string{"u_a"}, Enabled: true})
+	p := pool.New("")
+	p.Add(&auth.Auth{UID: "u_a", Nickname: "A"})
+	p.Pause("u_a")
+	h := NewHandler(Config{Pool: p, Upstream: upstream.New(), APIKey: "root", Keys: ks, MaxRotate: 1})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"cn:m","messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("Authorization", "Bearer "+globalPlain)
+	h.ServeHTTP(rec, req)
+	body := rec.Body.String()
+	if strings.Contains(body, "绑定账号") {
+		t.Fatalf("global 模式不该出绑定明细: %s", body)
+	}
+}
+
+// TestBoundKeyStickyGuard 粘性护栏：历史粘性指向非绑定号时，绑定密钥必须忽略它、
+// 解绑并回落到自己的绑定集合（否则 A 用户的会话会把请求带到 B 的账号上）。
+func TestBoundKeyStickyGuard(t *testing.T) {
+	ks, err := keystore.New(t.TempDir() + "/keys.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, plain, err := ks.Create(keystore.CreateInput{Name: "绑定A", Mode: keystore.ModeBound, UIDs: []string{"u_a"}, Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := newBindStore()
+	sess := session.New(session.Config{
+		TTL:       time.Minute,
+		Store:     st,
+		Available: func() []string { return []string{"u_a", "u_b"} },
+	})
+	p := testPoolWith(
+		&auth.Auth{UID: "u_a", AccessToken: "at-a", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "u_b", AccessToken: "at-b", ExpiresAt: 9999999999},
+	)
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) { return 200, sseOK, true })
+	h := NewHandler(Config{
+		Pool: p, Upstream: up, Session: sess, SoftCooldown: time.Minute,
+		APIKey: "root", Keys: ks,
+	})
+	sess.Bind("conv-1", "u_b") // 历史粘性指向非绑定号
+	req := httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","messages":[],"metadata":{"conversation_id":"conv-1"}}`))
+	req.Header.Set("Authorization", "Bearer "+plain)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	if uid, ok := st.lastUID("conv-1"); !ok || uid != "u_a" {
+		t.Fatalf("粘性必须收敛到绑定号 u_a，得到 %q (ok=%v)", uid, ok)
+	}
+}
