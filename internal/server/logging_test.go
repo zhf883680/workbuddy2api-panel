@@ -379,7 +379,7 @@ func TestLogChatRowExtendedFields(t *testing.T) {
 	withChatLog(t)
 	out := captureStdout(t, func() {
 		logChatRowEx(10*time.Millisecond, 2*time.Second, "glm-5.3", "stream", "u123456789", "示例号",
-			http.StatusOK, 42, "req-abc123", reqlog.OutcomeSuccess, 2, 1.25, true, "", "")
+			http.StatusOK, 42, "req-abc123", reqlog.OutcomeSuccess, 2, 1.25, true, "", "", "")
 	})
 	for _, want := range []string{"rid=req-abc123", "out=success", "try=2", "credit=1.2500"} {
 		if !strings.Contains(out, want) {
@@ -398,7 +398,7 @@ func TestLogChatRowSourceFields(t *testing.T) {
 	out := captureStdout(t, func() {
 		logChatRowEx(10*time.Millisecond, 2*time.Second, "glm-5.3", "stream", "u123456789", "示例号",
 			http.StatusOK, 42, "req-abc123", reqlog.OutcomeSuccess, 1, 0, false,
-			"203.0.113.7", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+			"203.0.113.7", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36", "")
 	})
 	for _, want := range []string{`src=203.0.113.7`, `ua="Chrome/120.0.0.0"`} {
 		if !strings.Contains(out, want) {
@@ -546,7 +546,7 @@ func TestLogChatRowShowsThinkingTokens(t *testing.T) {
 	out := captureStdout(t, func() {
 		logChatRowFull(1200*time.Millisecond, 8*time.Second, "deepseek-v4.1-flash", "stream",
 			"u123456789", "示例号", http.StatusOK, 1450, 1255, 0, 0, false,
-			"req-x", reqlog.OutcomeSuccess, 1, 0.02, true, "", "", 15*time.Millisecond, 1400*time.Millisecond, "high", "max")
+			"req-x", reqlog.OutcomeSuccess, 1, 0.02, true, "", "", 15*time.Millisecond, 1400*time.Millisecond, "high", "max", "")
 	})
 	if !strings.Contains(out, "tok=1450 think=1255") {
 		t.Errorf("row should show thinking tokens: %s", out)
@@ -564,7 +564,7 @@ func TestLogChatRowShowsThinkingTokens(t *testing.T) {
 	outSame := captureStdout(t, func() {
 		logChatRowFull(1200*time.Millisecond, 8*time.Second, "deepseek-v4.1-flash", "stream",
 			"u123456789", "示例号", http.StatusOK, 1450, 1255, 0, 0, false,
-			"req-y", reqlog.OutcomeSuccess, 1, 0.02, true, "", "", 15*time.Millisecond, 1400*time.Millisecond, "high", "high")
+			"req-y", reqlog.OutcomeSuccess, 1, 0.02, true, "", "", 15*time.Millisecond, 1400*time.Millisecond, "high", "high", "")
 	})
 	if !strings.Contains(outSame, "effort=high") || strings.Contains(outSame, "effort=high->") {
 		t.Errorf("same-tier row should show plain effort=high: %s", outSame)
@@ -604,5 +604,24 @@ func TestChatStatsReaderThinkingTokens(t *testing.T) {
 	feedStatsLines(s3, `data: {"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`)
 	if n, ok := s3.Thinking(); ok || n != 0 {
 		t.Fatalf("thinking=%d ok=%v want 0/false（无该观测）", n, ok)
+	}
+}
+
+// 密钥标识必须落进流水行；未启用密钥体系（无身份）时不追加 key 段，旧格式不变。
+func TestLogChatRowKeyField(t *testing.T) {
+	withChatLog(t)
+	out := captureStdout(t, func() {
+		logChatRowEx(10*time.Millisecond, 2*time.Second, "glm-5.3", "stream", "u123456789", "示例号",
+			http.StatusOK, 42, "req-abc123", reqlog.OutcomeSuccess, 1, 0, false, "", "", "小王(k1a2b3c4)")
+	})
+	if !strings.Contains(out, "key=小王(k1a2b3c4)") {
+		t.Errorf("key field missing:\n%s", out)
+	}
+	legacy := captureStdout(t, func() {
+		logChatRowEx(10*time.Millisecond, 2*time.Second, "glm-5.3", "stream", "u123456789", "示例号",
+			http.StatusOK, 42, "req-abc123", reqlog.OutcomeSuccess, 1, 0, false, "", "", "")
+	})
+	if strings.Contains(legacy, "key=") {
+		t.Errorf("empty identity must not add key field:\n%s", legacy)
 	}
 }

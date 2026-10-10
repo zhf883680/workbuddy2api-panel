@@ -63,10 +63,13 @@ type chatStat struct {
 	promptTokens     int64
 	completionTokens int64
 	totalTokens      int64
-	cacheHit         int
-	cacheMiss        int
-	hasCache         bool
-	budget           *dailyBudget
+	// identity 本次请求的调用方身份（chatCompletions 内采集）。done() 在本函数返回前
+	// 执行（早于 ServeHTTP 的 trace defer），所以这里单独持有，供流水行打印密钥列。
+	identity  Identity
+	cacheHit  int
+	cacheMiss int
+	hasCache  bool
+	budget    *dailyBudget
 
 	// 调用来源（客户端 IP / User-Agent）。空 = 未采集（logging.request_client_info
 	// 关闭，或非 chat 路径），展示层一律以 "-" 兜底。
@@ -110,10 +113,27 @@ func (s *chatStat) done() {
 	logChatRowFull(s.ttfb, total, s.model, s.mode, s.uid, s.nick, s.status, s.toks,
 		s.think, s.cacheHit, s.cacheMiss, s.hasCache,
 		s.requestID, s.outcome, s.attempts, s.credit, s.hasCredit,
-		s.clientIP, s.userAgent, s.prep, s.do, s.effort, s.effortReq)
+		s.clientIP, s.userAgent, s.prep, s.do, s.effort, s.effortReq, s.keyLabel())
 	s.budget.add(s.credit, s.hasCredit)
 	s.budget.observeCache(int64(s.cacheHit), int64(s.cacheMiss), s.hasCache)
 	noteProm(s, total)
+}
+
+// keyLabel 流水行的密钥标识「名称(id8)」；无身份（未启用密钥体系）时返回空串，
+// 此时不追加 key 段，旧行格式保持不变。
+func (s *chatStat) keyLabel() string {
+	if s == nil || s.identity.KeyID == "" {
+		return ""
+	}
+	id := s.identity.KeyID
+	if len(id) > 8 {
+		id = id[:8]
+	}
+	name := s.identity.KeyName
+	if name == "" {
+		name = id
+	}
+	return name + "(" + id + ")"
 }
 
 // chatStatsReader 在流式透传时抓取 SSE 末帧的 usage.completion_tokens 精确值，
@@ -412,6 +432,9 @@ type requestTrace struct {
 	// path 本次请求的真实入站路径（isChatEntry 四条之一），归档事件按它记录——
 	// 来源采集与归档已覆盖 /v1/responses、/v1/messages，不能再写死 chat 路径。
 	path string
+	// identity 本次请求的调用方身份（withAuth 写入，ServeHTTP 的 defer 采集）：
+	// 供归档事件与 stdout 流水行标注"这条请求是谁打进来的"。
+	identity Identity
 	// 调用来源，进入 handler 时一次性采集（见 ServeHTTP / captureClientInfo）。
 	clientIP  string
 	userAgent string
@@ -493,6 +516,8 @@ func (t *requestTrace) event(status int) reqlog.Event {
 	}
 	e.ClientIP = t.clientIP
 	e.UserAgent = t.userAgent
+	e.KeyID = t.identity.KeyID
+	e.KeyName = t.identity.KeyName
 	if e.Outcome == "" {
 		if status >= 200 && status < 300 {
 			e.Outcome = reqlog.OutcomeSuccess
@@ -558,16 +583,16 @@ const (
 //
 // logChatRow 旧形态（带缓存命中率、无请求 ID）；新代码请用 logChatRowFull。
 func logChatRow(ttfb, total time.Duration, model, mode, uid, nick string, status int, toks int, cacheHit, cacheMiss int, hasCache bool) {
-	logChatRowFull(ttfb, total, model, mode, uid, nick, status, toks, -1, cacheHit, cacheMiss, hasCache, "", "", 0, 0, false, "", "", 0, 0, "", "")
+	logChatRowFull(ttfb, total, model, mode, uid, nick, status, toks, -1, cacheHit, cacheMiss, hasCache, "", "", 0, 0, false, "", "", 0, 0, "", "", "")
 }
 
 // logChatRowEx 带请求 ID、结果、重试、积分与调用来源字段的扩展形态；缓存列不传
 // （显示 "-"）；来源两参均为空时不追加来源段。
 func logChatRowEx(ttfb, total time.Duration, model, mode, uid, nick string, status int, toks int,
 	requestID, outcome string, attempts int, credit float64, hasCredit bool,
-	clientIP, userAgent string) {
+	clientIP, userAgent, keyLabel string) {
 	logChatRowFull(ttfb, total, model, mode, uid, nick, status, toks, -1, 0, 0, false,
-		requestID, outcome, attempts, credit, hasCredit, clientIP, userAgent, 0, 0, "", "")
+		requestID, outcome, attempts, credit, hasCredit, clientIP, userAgent, 0, 0, "", "", keyLabel)
 }
 
 // logChatRowFull 是本文件唯一的行输出点：宽表字段 + 缓存列 + 可选请求 ID/结果/重试/积分尾段 + 调用来源段。
@@ -578,7 +603,7 @@ func logChatRowEx(ttfb, total time.Duration, model, mode, uid, nick string, stat
 func logChatRowFull(ttfb, total time.Duration, model, mode, uid, nick string, status int, toks int,
 	think int, cacheHit, cacheMiss int, hasCache bool,
 	requestID, outcome string, attempts int, credit float64, hasCredit bool,
-	clientIP, userAgent string, prep, do time.Duration, effort, effortReq string) {
+	clientIP, userAgent string, prep, do time.Duration, effort, effortReq string, keyLabel string) {
 	if !chatLogEnabled {
 		return
 	}
@@ -646,6 +671,11 @@ func logChatRowFull(ttfb, total time.Duration, model, mode, uid, nick string, st
 	// 调用来源：IP 用可解析的裸值（便于 grep），UA 用 ShortUA 压缩后的客户端标签
 	// 并加引号（标签内可能含空格，如 `OpenAI/Python 1.30.0` 只会取到 OpenAI/Python）。
 	// 两者都未采集时不追加，旧行格式保持不变。
+	// 密钥列：只在有身份时追加（未启用密钥体系时旧行格式逐字不变）。
+	keySeg := ""
+	if keyLabel != "" {
+		keySeg = " key=" + keyLabel + " |"
+	}
 	src := ""
 	if clientIP != "" || userAgent != "" {
 		ua := "-"
@@ -654,7 +684,7 @@ func logChatRowFull(ttfb, total time.Duration, model, mode, uid, nick string, st
 		}
 		src = fmt.Sprintf(" src=%s ua=%s |", dashIfEmpty(clientIP), ua)
 	}
-	fmt.Fprintf(chatLogOut, "| #%03d | %s | %s | %s | %d | %s | TTFB=%s | tok=%s | %s | cache=%s | total=%.1fs |%s%s%s\n",
+	fmt.Fprintf(chatLogOut, "| #%03d | %s | %s | %s | %d | %s | TTFB=%s | tok=%s | %s | cache=%s | total=%.1fs |%s%s%s%s\n",
 		seq,
 		time.Now().Format("15:04:05"),
 		model,
@@ -668,6 +698,7 @@ func logChatRowFull(ttfb, total time.Duration, model, mode, uid, nick string, st
 		total.Seconds(),
 		split,
 		extra,
+		keySeg,
 		src,
 	)
 }

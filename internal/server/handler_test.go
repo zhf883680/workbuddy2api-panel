@@ -21,6 +21,7 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/prompt"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/redisstore"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/reqlog"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/session"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/usage"
@@ -2766,5 +2767,80 @@ func TestBoundKeyStickyGuard(t *testing.T) {
 	}
 	if uid, ok := st.lastUID("conv-1"); !ok || uid != "u_a" {
 		t.Fatalf("粘性必须收敛到绑定号 u_a，得到 %q (ok=%v)", uid, ok)
+	}
+}
+
+// TestRequestLogRecordsKeyIdentity 请求日志必须带上「哪把密钥」的标识（spec §7.3 / AC7），
+// 且只记 ID/名称、不记明文。
+func TestRequestLogRecordsKeyIdentity(t *testing.T) {
+	ks, err := keystore.New(t.TempDir() + "/keys.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	k, plain, err := ks.Create(keystore.CreateInput{Name: "小王", Mode: keystore.ModeGlobal, Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	metrics := reqlog.New(reqlog.Config{})
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999})
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) { return 200, sseOK, true })
+	h := NewHandler(Config{Pool: p, Upstream: up, APIKey: "root", Keys: ks, RequestLog: metrics})
+
+	req := httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","messages":[]}`))
+	req.Header.Set("Authorization", "Bearer "+plain)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	recent := metrics.Snapshot().Recent
+	if len(recent) != 1 {
+		t.Fatalf("应有 1 条请求记录，得到 %d", len(recent))
+	}
+	if recent[0].KeyID != k.ID || recent[0].KeyName != "小王" {
+		t.Fatalf("event key = %q/%q, want %q/小王", recent[0].KeyID, recent[0].KeyName, k.ID)
+	}
+	if strings.Contains(rec.Body.String(), plain) {
+		t.Fatal("响应体不得包含密钥明文")
+	}
+}
+
+// TestUsageCountedPerKey 分发密钥的 token 用量落在自己账上，根密钥不计数。
+func TestUsageCountedPerKey(t *testing.T) {
+	ks, err := keystore.New(t.TempDir() + "/keys.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	k, plain, err := ks.Create(keystore.CreateInput{Name: "计数", Mode: keystore.ModeGlobal, Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999})
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) { return 200, sseOK, true })
+	h := NewHandler(Config{Pool: p, Upstream: up, APIKey: "root", Keys: ks})
+	req := httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","messages":[]}`))
+	req.Header.Set("Authorization", "Bearer "+plain)
+	h.ServeHTTP(httptest.NewRecorder(), req)
+
+	list := ks.List()
+	if len(list) != 1 {
+		t.Fatalf("密钥数量 = %d", len(list))
+	}
+	if list[0].ID != k.ID || list[0].Usage.Req == 0 {
+		t.Fatalf("用量未落在该密钥上: %+v", list[0])
+	}
+	if list[0].LastUsedAt == 0 {
+		t.Fatal("LastUsedAt 未更新")
+	}
+
+	// 根密钥请求：不产生任何密钥计数（列表里只有上面那把，Req 不变）。
+	reqRoot := httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","messages":[]}`))
+	reqRoot.Header.Set("Authorization", "Bearer root")
+	h.ServeHTTP(httptest.NewRecorder(), reqRoot)
+	if got := ks.List()[0].Usage.Req; got != list[0].Usage.Req {
+		t.Fatalf("根密钥不该计入分发密钥: %d -> %d", list[0].Usage.Req, got)
 	}
 }

@@ -1109,13 +1109,24 @@ function reqMatch(e, f) {
   f = f || reqFilter;
   if (f.outcome && String(e && e.outcome || '') !== f.outcome) return false;
   if (f.q) {
-    const text = [e && e.client_ip, e && e.user_agent, e && e.model, e && e.account, e && e.request_id]
+    const text = [e && e.client_ip, e && e.user_agent, e && e.model, e && e.account, e && e.key_name, e && e.key_id, e && e.request_id]
       .filter(Boolean).join(' ').toLowerCase();
     for (const kw of f.q.toLowerCase().split(/\s+/).filter(Boolean)) {
       if (!text.includes(kw)) return false;
     }
   }
   return true;
+}
+
+// keyCell 请求记录的「密钥」列：根密钥显式标注，分发密钥显示名称(id8)，
+// 无身份（未启用密钥体系）或本功能上线前的旧归档行显示 —。
+function keyCell(e) {
+  const id = e && e.key_id ? String(e.key_id) : '';
+  if (!id) return '<span class="muted">—</span>';
+  if (id === 'root') return '<span class="clip">根密钥</span>';
+  const short = id.length > 8 ? id.slice(0, 8) : id;
+  const name = e && e.key_name ? String(e.key_name) : short;
+  return '<span class="clip" title="' + esc(name + '(' + id + ')') + '">' + esc(name + '(' + short + ')') + '</span>';
 }
 
 function reqOutcomeTag(e) {
@@ -1155,6 +1166,7 @@ function renderRequestTable() {
       '<td>' + reqOutcomeTag(e) + '</td>' +
       '<td>' + esc(e && e.model || '—') + '</td>' +
       '<td>' + esc(e && e.account || '—') + '</td>' +
+      '<td>' + keyCell(e) + '</td>' +
       '<td>' + (ip ? '<span class="clip ip" title="' + esc(ip) + '">' + esc(ip) + '</span>' : '<span class="muted">—</span>') + '</td>' +
       '<td>' + (ua ? '<span class="clip" title="' + esc(ua) + '">' + esc(ua) + '</span>' : '<span class="muted">—</span>') + '</td>' +
       '<td class="num">' + fmtMs(e && e.duration_ms) + '</td>' +
@@ -1162,7 +1174,7 @@ function renderRequestTable() {
       '<td class="num">' + reqCreditCell(e) + '</td>' +
       '<td>' + (rid ? '<span class="clip rid" title="' + esc(rid) + '">' + esc(rid) + '</span>' : '<span class="muted">—</span>') + '</td>' +
       '</tr>';
-  }).join('') || '<tr><td colspan="10" class="empty">' +
+  }).join('') || '<tr><td colspan="11" class="empty">' +
       (reqEntries.length ? '没有符合当前筛选条件的请求记录' : '暂无请求记录') + '</td></tr>';
 
   const filtered = list.length !== reqEntries.length;
@@ -1210,6 +1222,7 @@ function requestLogText(e) {
     String(e && e.status || '—') + ' ' + (outcomeLabel[e && e.outcome] || (e && e.outcome) || '—'),
     e && e.model || '—',
     e && e.account || '—',
+    e && (e.key_id === 'root' ? 'key=root' : (e && e.key_name ? 'key=' + e.key_name + '(' + e.key_id + ')' : '')),
     e && e.client_ip || '—',
     e && e.user_agent || '—',
     fmtMs(e && e.duration_ms),
