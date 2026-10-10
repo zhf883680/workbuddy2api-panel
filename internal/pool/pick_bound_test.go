@@ -1,6 +1,7 @@
 package pool
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -63,5 +64,54 @@ func TestPickBoundFallbackStaysInsideAllowed(t *testing.T) {
 	p.Cooldown("u_b", CoolHard, time.Hour, "test")
 	if a := p.PickExcludingForRealmBound(nil, "", "", map[string]bool{"u_b": true}); a != nil {
 		t.Fatalf("硬冷却号不该被兜底选中，得到 %s", a.UID)
+	}
+}
+
+func TestExplainBound(t *testing.T) {
+	p := pickBoundTestPool(t)
+	p.Disable("u_a", "test")
+	p.Pause("u_c")
+	got := p.ExplainBound([]string{"u_a", "u_b", "u_c", "u_ghost"}, "cn", "")
+	byUID := map[string]UnavailableReason{}
+	for _, r := range got {
+		byUID[r.UID] = r
+	}
+	if byUID["u_a"].Code != "disabled" {
+		t.Fatalf("u_a = %+v", byUID["u_a"])
+	}
+	if byUID["u_b"].Code != "ok" {
+		t.Fatalf("u_b 应可用: %+v", byUID["u_b"])
+	}
+	if byUID["u_c"].Code != "paused" {
+		t.Fatalf("u_c = %+v", byUID["u_c"])
+	}
+	if byUID["u_ghost"].Code != "not_found" {
+		t.Fatalf("u_ghost = %+v", byUID["u_ghost"])
+	}
+}
+
+func TestExplainBoundRealmMismatch(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u_g", Nickname: "g", Domain: "workbuddy.ai"})
+	got := p.ExplainBound([]string{"u_g"}, "cn", "")
+	if len(got) != 1 || got[0].Code != "realm_mismatch" {
+		t.Fatalf("跨域账号应判 realm_mismatch，得到 %+v", got)
+	}
+}
+
+func TestSummarizeUnavailable(t *testing.T) {
+	got := SummarizeUnavailable([]UnavailableReason{
+		{UID: "a", Code: "cooling", Until: time.Now().Add(30 * time.Minute)},
+		{UID: "b", Code: "in_flight_full"},
+		{UID: "c", Code: "ok"},
+	})
+	if !strings.Contains(got, "冷却中") || !strings.Contains(got, "在途占满") {
+		t.Fatalf("摘要 = %q", got)
+	}
+	if SummarizeUnavailable([]UnavailableReason{{UID: "a", Code: "ok"}}) != "" {
+		t.Fatal("全部可用应返回空串")
+	}
+	if SummarizeUnavailable(nil) != "" {
+		t.Fatal("空输入应返回空串")
 	}
 }
