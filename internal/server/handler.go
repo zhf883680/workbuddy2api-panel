@@ -218,7 +218,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	r = r.WithContext(context.WithValue(r.Context(), identityBoxKey{}, &identityBox{}))
 	if h.cfg.RequestLog != nil && r.Method == http.MethodPost &&
 		(r.URL.Path == "/v1/chat/completions" || r.URL.Path == "/v1/responses") {
-		trace := &requestTrace{id: reqlog.NewRequestID(), start: time.Now()}
+		trace := &requestTrace{id: reqlog.NewRequestID(), start: time.Now(), path: r.URL.Path}
 		if h.loadLive().RecordClientInfo {
 			trace.captureClientInfo(r)
 		}

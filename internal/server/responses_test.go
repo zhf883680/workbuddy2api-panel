@@ -11,6 +11,7 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/keystore"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/reqlog"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
 
@@ -169,5 +170,25 @@ func TestResponsesEndpointRequiresAuth(t *testing.T) {
 	h.ServeHTTP(rec, req)
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("无密钥应 401，得到 %d", rec.Code)
+	}
+}
+
+// 端到端：/v1/responses 的请求日志 path 必须是 /v1/responses（否则两种协议在运行日志里分不开）。
+func TestResponsesEndpointLogsActualPath(t *testing.T) {
+	metrics := reqlog.New(reqlog.Config{})
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999})
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) { return 200, sseOK, true })
+	h := NewHandler(Config{Pool: p, Upstream: up, APIKey: "root", RequestLog: metrics})
+
+	req := httptest.NewRequest("POST", "/v1/responses", strings.NewReader(responsesReqBody))
+	req.Header.Set("Authorization", "Bearer root")
+	h.ServeHTTP(httptest.NewRecorder(), req)
+
+	recent := metrics.Snapshot().Recent
+	if len(recent) != 1 {
+		t.Fatalf("应有 1 条请求记录，得到 %d", len(recent))
+	}
+	if recent[0].Path != "/v1/responses" {
+		t.Fatalf("path = %q，want /v1/responses", recent[0].Path)
 	}
 }
