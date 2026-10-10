@@ -113,7 +113,7 @@ try {
 		t.Fatal(err)
 	}
 	hf.Close()
-	for _, hash := range []string{"#taskscenter", "#accounts", "#usage", "#models", "#config", "#logs", "#packages"} {
+	for _, hash := range []string{"#taskscenter", "#accounts", "#keys", "#usage", "#models", "#config", "#logs", "#packages"} {
 		cmd := exec.Command(node, hf.Name(), "app.js")
 		cmd.Dir = "." // 测试工作目录 = internal/panel
 		cmd.Env = append(os.Environ(), "SMOKE_HASH="+hash)
@@ -2106,6 +2106,33 @@ func TestFrontendRequestLogKeyColumn(t *testing.T) {
 	for _, want := range []string{"function keyCell", "keyCell(e)", `colspan="11"`} {
 		if !strings.Contains(js, want) {
 			t.Fatalf("app.js 缺少 %q", want)
+		}
+	}
+}
+
+// 密钥页签必须完整存在（导航 + 视图 + 两个弹层 + JS 接线），
+// 否则页面能开但功能入口是空的（Go 侧不执行 JS，只能靠静态断言 + smoke）。
+func TestFrontendHasKeysView(t *testing.T) {
+	p := newTestPanel()
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, httptest.NewRequest("GET", "/panel/", nil))
+	body := rec.Body.String()
+	for _, want := range []string{
+		`data-view="keys"`, `id="view-keys"`, `id="keysBody"`,
+		`id="keyCreateVeil"`, `id="keyPlainVeil"`, `id="keyUids"`, `id="btnKeyCreate"`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("index.html 缺少 %s", want)
+		}
+	}
+	raw, err := os.ReadFile("app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	js := string(raw)
+	for _, want := range []string{"loadKeys", "renderKeys", "keyFormPayload", "showKeyPlain", "fmtKeyUIDs", "keyStatus", "keys: '密钥'"} {
+		if !strings.Contains(js, want) {
+			t.Fatalf("app.js 缺少 %s", want)
 		}
 	}
 }
