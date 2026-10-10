@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/linguo2625469/workbuddy2api-panel/internal/loginlock"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/prompt"
 )
 
@@ -30,6 +31,26 @@ type Config struct {
 		// PackageDetailLimit 积分构成页单账号默认展示的最近到期包数；<=0 回落 5。
 		PackageDetailLimit int `json:"package_detail_limit"`
 	} `json:"panel"`
+
+	// Security 安全策略（等保「登录失败处理」：限制非法登录次数）。
+	Security struct {
+		// LoginLockout 鉴权失败锁定：同一来源（客户端 IP）在 window 内累计
+		// max_fails 次鉴权失败即锁定 lock_duration，锁定期内一律 429。
+		//
+		// 为什么按来源而不是按"账号"：面板与网关没有用户名体系，唯一凭据就是
+		// api_key，能区分攻击者的只有来源地址。计数覆盖 /panel/*、/status 与
+		// /v1/*（同一个密钥的枚举面是同一件事，分开记账等于留一条免锁旁路）。
+		// 状态在进程内存，重启即清空（也是误锁时的兜底解锁手段）。
+		LoginLockout struct {
+			Enabled bool `json:"enabled"` // 缺省 true；false = 关闭（鉴权失败仍只回 401）
+			// MaxFails 窗口内允许的失败次数；<=0 回落 5。
+			MaxFails int `json:"max_fails"`
+			// Window 失败计数窗口（Go 时长，"5m"）；空值回落 5m，非正值报错。
+			Window string `json:"window"`
+			// LockDuration 锁定持续时长（"10m"）；空值回落 10m，非正值报错。
+			LockDuration string `json:"lock_duration"`
+		} `json:"login_lockout"`
+	} `json:"security"`
 
 	Logging struct {
 		// RequestArchiveEnabled 请求元数据 JSONL 归档开关，缺省 true。
@@ -232,6 +253,9 @@ type Config struct {
 	CostExploreIntervalDur time.Duration `json:"-"`
 	// ServerReadTimeoutDur 解析后的入站请求读取上限（issue #100）；0 = 不限制。
 	ServerReadTimeoutDur time.Duration `json:"-"`
+
+	// LoginLockoutPolicy 解析后的鉴权失败锁定策略（消费方：internal/loginlock）。
+	LoginLockoutPolicy loginlock.Policy `json:"-"`
 }
 
 // Default 默认配置。
@@ -246,6 +270,12 @@ func Default() *Config {
 	c.Cooldown.SoftRateMax = "2h"
 	c.Server.ReadTimeout = "300s"
 	c.Panel.PackageDetailLimit = 5
+	// 登录失败锁定：默认开启（5 次 / 5 分钟窗口 / 锁 10 分钟）。
+	// 缺省 true 靠显式赋值实现（同 Schedule 开关）：JSON 键缺席时保留 true。
+	c.Security.LoginLockout.Enabled = true
+	c.Security.LoginLockout.MaxFails = 5
+	c.Security.LoginLockout.Window = "5m"
+	c.Security.LoginLockout.LockDuration = "10m"
 	c.Logging.RequestArchiveEnabled = true
 	c.Logging.RequestRetentionDays = 7
 	c.Logging.RequestArchiveMaxMB = 100
@@ -463,6 +493,9 @@ func (c *Config) normalize() error {
 	if c.Panel.PackageDetailLimit <= 0 {
 		c.Panel.PackageDetailLimit = 5
 	}
+	if err := c.normalizeLoginLockout(); err != nil {
+		return err
+	}
 	if c.Logging.RequestRetentionDays <= 0 {
 		c.Logging.RequestRetentionDays = 7
 	}
@@ -627,6 +660,45 @@ func (c *Config) normalizePrompt() error {
 			return err
 		}
 		c.PromptText = text
+	}
+	return nil
+}
+
+// normalizeLoginLockout 归一化鉴权失败锁定策略并解析成 loginlock.Policy。
+//
+// 校验口径：空缺回落默认（沿用 Default() 的 5 / 5m / 10m）；非正时长 fail fast
+// ——把"写错的时长"静默当成关闭，会让人以为锁已生效，实际等于没配（同
+// server.read_timeout 的处理风格）。要关闭请显式 enabled=false。
+func (c *Config) normalizeLoginLockout() error {
+	l := &c.Security.LoginLockout
+	if l.MaxFails <= 0 {
+		l.MaxFails = 5
+	}
+	if l.Window == "" {
+		l.Window = "5m"
+	}
+	if l.LockDuration == "" {
+		l.LockDuration = "10m"
+	}
+	window, err := time.ParseDuration(l.Window)
+	if err != nil {
+		return fmt.Errorf("security.login_lockout.window: %w", err)
+	}
+	if window <= 0 {
+		return fmt.Errorf("security.login_lockout.window: %q 不是正时长（如 5m）；如要关闭锁定请设 security.login_lockout.enabled=false", l.Window)
+	}
+	lockFor, err := time.ParseDuration(l.LockDuration)
+	if err != nil {
+		return fmt.Errorf("security.login_lockout.lock_duration: %w", err)
+	}
+	if lockFor <= 0 {
+		return fmt.Errorf("security.login_lockout.lock_duration: %q 不是正时长（如 10m）；如要关闭锁定请设 security.login_lockout.enabled=false", l.LockDuration)
+	}
+	c.LoginLockoutPolicy = loginlock.Policy{
+		Enabled:      l.Enabled,
+		MaxFails:     l.MaxFails,
+		Window:       window,
+		LockDuration: lockFor,
 	}
 	return nil
 }

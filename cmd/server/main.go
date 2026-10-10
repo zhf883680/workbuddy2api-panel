@@ -20,6 +20,7 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/keystore"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/loginlock"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/panel"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/redisstore"
@@ -278,19 +279,30 @@ func main() {
 		log.Printf("[reqlog] 请求指标已启用；JSONL 归档已关闭")
 	}
 
+	// 鉴权失败锁定（等保「登录失败处理」）：单一实例同时注入面板与网关——
+	// 同一个 api_key 的枚举面是同一件事，两边分开记账等于留一条免锁旁路。
+	loginLock := loginlock.New(cfg.LoginLockoutPolicy)
+	if cfg.LoginLockoutPolicy.Active() {
+		log.Printf("[security] 鉴权失败锁定已启用：%d 次 / %s 内 → 锁 %s（按来源 IP，覆盖面板与 /v1）",
+			cfg.LoginLockoutPolicy.MaxFails, cfg.LoginLockoutPolicy.Window, cfg.LoginLockoutPolicy.LockDuration)
+	} else {
+		log.Printf("[security] 鉴权失败锁定已关闭（security.login_lockout.enabled=false）")
+	}
+
 	pn := panel.New(panel.Config{
-		Pool:        p,
-		Keys:        keys,
-		Usage:       rec,
-		RequestLog:  requestLog,
-		Upstream:    up,
-		Scheduler:   sch,
-		AuthDir:     cfg.AuthDir,
-		APIKey:      cfg.APIKey,
-		RedisMode:   redisMode,
-		StickyCount: sessCount,
-		Version:     appVersion,
-		Live:        live,
+		Pool:         p,
+		Keys:         keys,
+		Usage:        rec,
+		RequestLog:   requestLog,
+		Upstream:     up,
+		Scheduler:    sch,
+		AuthDir:      cfg.AuthDir,
+		APIKey:       cfg.APIKey,
+		RedisMode:    redisMode,
+		StickyCount:  sessCount,
+		Version:      appVersion,
+		Live:         live,
+		LoginLockout: loginLock,
 		// 模型上限探测数据（scripts/probe_max_tokens.py --panel-out 写入）：
 		// 与 state 文件同目录，缺省 data/output_probes.json。
 		ProbeFile:  stateSibling(cfg.StateFile, "output_probes.json"),
@@ -299,7 +311,7 @@ func main() {
 			return Load(*cfgPath)
 		},
 		SaveConfig: func(raw []byte) ([]string, error) {
-			return saveConfig(raw, *cfgPath, live, p, up, sch)
+			return saveConfig(raw, *cfgPath, live, p, up, sch, loginLock)
 		},
 	})
 	// 成长任务队列每日自动执行（与「执行全部待办」同管线）：Sequential 族零点解锁后
@@ -321,6 +333,7 @@ func main() {
 		Live:         live,
 		Usage:        rec,
 		RequestLog:   requestLog,
+		LoginLockout: loginLock,
 		PromptMode:   cfg.Prompt.Mode,
 		PromptText:   cfg.PromptText,
 		// 来源记录开关经 livecfg 热生效；此处同时填静态字段，供 Live 为 nil 的
@@ -428,6 +441,7 @@ func panelListenPath(listen string) string {
 //
 // 热生效范围（设计取舍）：
 //   - api_key / cooldown.soft_rate / features.sanitize_blacklist_fingerprints → livecfg 快照
+//   - security.login_lockout → loginlock.Limiter.SetPolicy
 //   - pool.* → pool.SetBreaker/SetMaxInFlight/SetSoftRateMax/SetWeights/SetCostExploreInterval/SetPreferExpiring/SetCreditFloor
 //   - schedule.* → scheduler.Reconfigure/SetBalanceInterval/SetExpiringSoonWindow
 //
@@ -437,7 +451,7 @@ func panelListenPath(listen string) string {
 // 落盘用"先写 tmp 再 rename"原子替换，且优先保留磁盘上的原始 JSON 结构（只改
 // 面板表单覆盖到的键），避免把用户手写的注释性字段/未知键洗掉——这里直接整体
 // 序列化校验后的配置，未知键在 json.Unmarshal 时已丢失，故先合并原始 map。
-func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up *upstream.Client, sch *scheduler.Scheduler) ([]string, error) {
+func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up *upstream.Client, sch *scheduler.Scheduler, loginLock *loginlock.Limiter) ([]string, error) {
 	// 1) 解析原始 JSON 为 map（保留用户手写的未知键），再叠加面板提交的键。
 	oldRaw, err := os.ReadFile(path)
 	if err != nil {
@@ -503,6 +517,7 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 		SanitizeFingerprints: newCfg.Features.SanitizeBlacklistFingerprints,
 		RecordClientInfo:     newCfg.Logging.RequestClientInfo,
 	})
+	loginLock.SetPolicy(newCfg.LoginLockoutPolicy) // 登录失败锁定策略热生效
 	up.SanitizeFingerprints.Store(newCfg.Features.SanitizeBlacklistFingerprints)
 	p.SetBreaker(newCfg.Pool.BreakerThreshold, newCfg.BreakerCooldownDur, newCfg.BreakerCooldownMaxD)
 	p.SetMaxInFlight(newCfg.Pool.MaxInFlight)

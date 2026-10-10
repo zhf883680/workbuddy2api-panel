@@ -12,6 +12,7 @@ package panel
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -25,6 +26,7 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/httpauth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/keystore"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/loginlock"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/reqlog"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/scheduler"
@@ -41,6 +43,11 @@ type Config struct {
 	APIKey    string               // 空 = 不鉴权（与主服务同语义）；与 Live 同时给出时 Live 优先
 	RedisMode string               // "upstash" / "noop"，仅观测透出
 	Version   string               // 面板版本号（展示用）
+
+	// LoginLockout 鉴权失败锁定（可选；nil = 关闭，行为与既有版本一致）。
+	// 与网关（server）共用同一实例：同一个 api_key 的枚举面同时覆盖 /panel/*
+	// 与 /v1、/status，分开记账等于给攻击者留一条免锁旁路。
+	LoginLockout *loginlock.Limiter
 
 	// Live 运行期可变配置（在线改配置立即生效）。
 	Live *livecfg.Holder
@@ -208,14 +215,47 @@ func (p *Panel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // withAuth 与 server 包同口径的 Bearer 鉴权（经 httpauth 常量时间比较）；
 // api_key 为空时放行。密钥经 livecfg 快照读取：面板里改了 api_key，下一个请求
 // 即用新值（无需重启）。
+//
+// 鉴权失败记账（loginlock，等保「登录失败处理」）：同一来源在窗口内累计失败到
+// 阈值即锁定一段时长，锁定期内一律 429（含正确密钥），到期自动放行。锁定键为
+// 客户端 IP（见 loginlock.ClientKey），与网关共用同一 Limiter 实例。
 func (p *Panel) withAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !httpauth.VerifyBearer(r, p.apiKey()) {
+		key := p.apiKey()
+		lock := p.cfg.LoginLockout
+		lockKey := ""
+		// 未启用鉴权（api_key 空）时不记账：此时没有任何凭据可"试错"。
+		if key != "" && lock.Enabled() {
+			lockKey = loginlock.ClientKey(r)
+			if ok, retry := lock.Allow(lockKey); !ok {
+				writeLocked(w, retry)
+				return
+			}
+		}
+		if !httpauth.VerifyBearer(r, key) {
+			if lockKey != "" {
+				if locked, retry := lock.Fail(lockKey); locked {
+					log.Printf("panel: 来源 %s 鉴权失败次数超限，锁定 %d 秒", lockKey, loginlock.SecondCeil(retry))
+					writeLocked(w, retry)
+					return
+				}
+			}
 			writeErr(w, http.StatusUnauthorized, "invalid_api_key")
 			return
 		}
 		next(w, r)
 	}
+}
+
+// writeLocked 来源被临时锁定的响应：429 + Retry-After（秒）+ 人话提示。
+// 面板前端据此在密钥门上显示"已锁定，请在 N 秒后重试"，而不是反复弹"密钥错误"。
+func writeLocked(w http.ResponseWriter, retry time.Duration) {
+	sec := loginlock.SecondCeil(retry)
+	if sec > 0 {
+		w.Header().Set("Retry-After", strconv.Itoa(sec))
+	}
+	writeErr(w, http.StatusTooManyRequests,
+		fmt.Sprintf("登录失败次数过多，已临时锁定，请在 %d 秒后重试", sec))
 }
 
 // apiKey 当前生效密钥（Live 优先，回落静态字段）。
