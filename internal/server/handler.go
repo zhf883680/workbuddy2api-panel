@@ -14,10 +14,12 @@ import (
 	"strings"
 
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/httpauth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/keystore"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
@@ -70,6 +72,10 @@ type Config struct {
 	// RequestLog 请求指标与脱敏 JSONL 归档（可选；nil = 不记录）。
 	RequestLog *reqlog.Recorder
 
+	// Keys 分发密钥存储（可选；nil = 未启用密钥体系，行为与只有根密钥时一致）。
+	// 面板签发、server 校验，同一实例注入（main 装配），改密钥下一个请求即生效。
+	Keys *keystore.Store
+
 	// RecordClientInfo 是否在请求日志里记录调用来源（客户端 IP / User-Agent）。
 	// 来自 logging.request_client_info（缺省 true）；关闭时 reqlog 事件的来源字段
 	// 保持为空，归档与面板都不出现来源信息。
@@ -110,6 +116,65 @@ const notFoundCooldown = 60 * time.Second
 // 返回 2xx 也不带本标识，宿主据此可识别"假成功"。
 const ServiceName = "workbuddy2api"
 
+// Identity 一次请求的调用方身份。
+//
+// Root 为真表示根密钥（config.api_key）—— 它能访问全部端点，且选号不受绑定约束。
+// 非 Root 即分发密钥：KeyID/KeyName 供日志与统计，Mode=bound 时 UIDs 限定候选账号集。
+type Identity struct {
+	Root    bool     // 根密钥
+	KeyID   string   // 分发密钥 ID；Root 为 "root"
+	KeyName string   // 分发密钥名称；Root 为 "根密钥"
+	Mode    string   // "global" | "bound"
+	UIDs    []string // Mode=bound 时的绑定账号
+}
+
+// AllowedUIDs 返回绑定集合；非绑定身份返回 nil（= 不限制候选集）。
+func (id Identity) AllowedUIDs() map[string]bool {
+	if id.Root || id.Mode != keystore.ModeBound {
+		return nil
+	}
+	out := make(map[string]bool, len(id.UIDs))
+	for _, u := range id.UIDs {
+		out[u] = true
+	}
+	return out
+}
+
+var rootIdentity = Identity{Root: true, KeyID: "root", KeyName: "根密钥", Mode: keystore.ModeGlobal}
+
+// authScope 端点权限域：决定分发密钥能否通过。
+type authScope int
+
+const (
+	scopeDataPlane  authScope = iota // /v1/*：根密钥 + 分发密钥
+	scopeManagement                  // /status 等：仅根密钥
+)
+
+// identityBox 请求级身份盒子。withAuth 在入口写一次，handler 与外层 trace defer 读。
+// 之所以用盒子而不是 r.WithContext：内层 handler 换出的新 *http.Request 对外层
+// ServeHTTP 闭包不可见（trace defer 捕获的是外层 r）。写发生在 handler 之前，
+// 读发生在其后（或由其派生的 goroutine），happens-before 成立。
+type identityBox struct{ v atomic.Pointer[Identity] }
+
+func (b *identityBox) Set(id Identity) { b.v.Store(&id) }
+
+func (b *identityBox) Get() Identity {
+	if p := b.v.Load(); p != nil {
+		return *p
+	}
+	return rootIdentity
+}
+
+type identityBoxKey struct{}
+
+// identityFrom 取当前请求身份；无盒子（测试直调 handler）时按根身份处理。
+func identityFrom(r *http.Request) Identity {
+	if b, ok := r.Context().Value(identityBoxKey{}).(*identityBox); ok {
+		return b.Get()
+	}
+	return rootIdentity
+}
+
 // Handler 主路由。
 type Handler struct {
 	cfg     Config
@@ -135,9 +200,9 @@ func NewHandler(cfg Config) *Handler {
 		cfg.PromptMode = "custom" // 缺省 custom：网关自有提示词
 	}
 	h := &Handler{cfg: cfg, mux: http.NewServeMux()}
-	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
-	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
-	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
+	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(scopeDataPlane, h.chatCompletions))
+	h.mux.HandleFunc("GET /v1/models", h.withAuth(scopeDataPlane, h.models))
+	h.mux.HandleFunc("GET /status", h.withAuth(scopeManagement, h.status))
 	h.mux.HandleFunc("GET /healthz", h.healthz)
 	if cfg.Panel != nil {
 		h.mux.Handle("/panel/", cfg.Panel) // /panel → /panel/ 由 ServeMux 自动重定向
@@ -146,6 +211,8 @@ func NewHandler(cfg Config) *Handler {
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// 身份盒子：withAuth 填写，handler 与外层 trace defer 读取。
+	r = r.WithContext(context.WithValue(r.Context(), identityBoxKey{}, &identityBox{}))
 	if h.cfg.RequestLog != nil && r.Method == http.MethodPost && r.URL.Path == "/v1/chat/completions" {
 		trace := &requestTrace{id: reqlog.NewRequestID(), start: time.Now()}
 		if h.loadLive().RecordClientInfo {
@@ -168,13 +235,65 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.mux.ServeHTTP(w, r)
 }
 
-func (h *Handler) withAuth(next http.HandlerFunc) http.HandlerFunc {
+// withAuth 鉴权并写入身份。scope 决定分发密钥是否放行：
+//   - scopeDataPlane：/v1/*，根密钥与分发密钥都放行；
+//   - scopeManagement：仅根密钥（分发密钥一律 401，避免把管理面暴露给被分发方）。
+//
+// api_key 为空 = 不鉴权部署：恒根身份，行为与既有实现完全一致。
+func (h *Handler) withAuth(scope authScope, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !httpauth.VerifyBearer(r, h.loadLive().APIKey) {
-			writeOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "missing or invalid API key")
+		id, code := h.authenticate(r, scope)
+		if code != "" {
+			writeOpenAIError(w, http.StatusUnauthorized, code, authErrorMessage(code))
 			return
 		}
+		if b, ok := r.Context().Value(identityBoxKey{}).(*identityBox); ok {
+			b.Set(id)
+		}
 		next(w, r)
+	}
+}
+
+// authErrorMessage 把鉴权错误码翻成一句调用方看得懂的话。
+// 三种码都返回 401：能区分它们的前提是持有正确明文，因此不构成对外信息泄露。
+func authErrorMessage(code string) string {
+	switch code {
+	case "api_key_disabled":
+		return "this API key has been disabled"
+	case "api_key_expired":
+		return "this API key has expired"
+	default:
+		return "missing or invalid API key"
+	}
+}
+
+// authenticate 判定请求身份；返回的 code 非空表示拒绝（调用方回 401）。
+func (h *Handler) authenticate(r *http.Request, scope authScope) (Identity, string) {
+	rootKey := h.loadLive().APIKey
+	if rootKey == "" {
+		return rootIdentity, "" // 未启用鉴权：直接放行（与既有语义一致）
+	}
+	if httpauth.VerifyBearer(r, rootKey) {
+		return rootIdentity, ""
+	}
+	// 到这里根密钥已不匹配：管理面直接拒绝，数据面才继续查分发密钥。
+	if scope == scopeManagement || h.cfg.Keys == nil {
+		return Identity{}, "invalid_api_key"
+	}
+	tok, ok := httpauth.BearerToken(r)
+	if !ok {
+		return Identity{}, "invalid_api_key"
+	}
+	k, res := h.cfg.Keys.Lookup(tok)
+	switch res {
+	case keystore.LookupOK:
+		return Identity{KeyID: k.ID, KeyName: k.Name, Mode: k.Mode, UIDs: k.UIDs}, ""
+	case keystore.LookupDisabled:
+		return Identity{}, "api_key_disabled"
+	case keystore.LookupExpired:
+		return Identity{}, "api_key_expired"
+	default:
+		return Identity{}, "invalid_api_key"
 	}
 }
 

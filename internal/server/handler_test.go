@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/keystore"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/prompt"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/redisstore"
@@ -1830,5 +1831,64 @@ func TestChatMarkupRepairStrictModeRejectsUndeclaredTool(t *testing.T) {
 	msg := resp["choices"].([]any)[0].(map[string]any)["message"].(map[string]any)
 	if _, ok := msg["tool_calls"]; ok {
 		t.Fatalf("未声明的工具名不得转换: %#v", msg["tool_calls"])
+	}
+}
+
+// TestDistributionKeyAuthMatrix 端点权限矩阵（spec §5.3）：
+// 根密钥通吃；分发密钥只能打数据面；禁用/过期/未知分别给不同错误码。
+func TestDistributionKeyAuthMatrix(t *testing.T) {
+	ks, err := keystore.New(t.TempDir() + "/keys.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, boundPlain, _ := ks.Create(keystore.CreateInput{Name: "绑定", Mode: keystore.ModeBound, UIDs: []string{"u_a"}, Enabled: true})
+	_, globalPlain, _ := ks.Create(keystore.CreateInput{Name: "全局", Mode: keystore.ModeGlobal, Enabled: true})
+	_, deadPlain, _ := ks.Create(keystore.CreateInput{Name: "停用", Mode: keystore.ModeGlobal, Enabled: false})
+	_, expPlain, _ := ks.Create(keystore.CreateInput{Name: "过期", Mode: keystore.ModeGlobal, Enabled: true, ExpiresAt: time.Now().Add(-time.Minute).Unix()})
+
+	cases := []struct {
+		name   string
+		token  string
+		path   string
+		status int
+		code   string
+	}{
+		{"根密钥可访问 /status", "root-secret", "/status", 200, ""},
+		{"分发密钥不可访问 /status", boundPlain, "/status", 401, "invalid_api_key"},
+		{"全局分发密钥可访问 /v1/models", globalPlain, "/v1/models", 200, ""},
+		{"绑定分发密钥可访问 /v1/models", boundPlain, "/v1/models", 200, ""},
+		{"停用密钥 401", deadPlain, "/v1/models", 401, "api_key_disabled"},
+		{"过期密钥 401", expPlain, "/v1/models", 401, "api_key_expired"},
+		{"未知密钥 401", "sk-nope", "/v1/models", 401, "invalid_api_key"},
+		{"空 api_key 部署放行", "", "/v1/models", 200, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			apiKey := "root-secret"
+			if tc.name == "空 api_key 部署放行" {
+				apiKey = ""
+			}
+			h := NewHandler(Config{Pool: pool.New(""), Upstream: upstream.New(), APIKey: apiKey, Keys: ks})
+			req := httptest.NewRequest("GET", tc.path, nil)
+			if tc.token != "" {
+				req.Header.Set("Authorization", "Bearer "+tc.token)
+			}
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+			if rec.Code != tc.status {
+				t.Fatalf("status = %d, want %d (body=%s)", rec.Code, tc.status, rec.Body.String())
+			}
+			if tc.code != "" {
+				var body struct {
+					Error struct {
+						Code string `json:"code"`
+					} `json:"error"`
+				}
+				_ = json.Unmarshal(rec.Body.Bytes(), &body)
+				if body.Error.Code != tc.code {
+					t.Fatalf("code = %q, want %q", body.Error.Code, tc.code)
+				}
+			}
+		})
 	}
 }
