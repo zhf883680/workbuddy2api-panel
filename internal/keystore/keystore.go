@@ -253,6 +253,131 @@ func (s *Store) List() []View {
 	return out
 }
 
+// UpdateInput 局部更新：nil 字段 = 保持不变（指针语义区分「显式传 false/空」与「不传」）。
+type UpdateInput struct {
+	Name      *string
+	Mode      *string
+	UIDs      *[]string
+	ExpiresAt *int64
+	Enabled   *bool
+}
+
+// Update 局部更新一把密钥，返回更新后的投影。不存在返回 ErrNotFound。
+func (s *Store) Update(id string, in UpdateInput) (View, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cur := s.snap.Load()
+	old, ok := findLocked(cur, id)
+	if !ok {
+		return View{}, ErrNotFound
+	}
+	next := *old // 值拷贝：只改字段，不污染旧快照（旧快照可能正被别人读）
+	if in.Name != nil {
+		next.Name = *in.Name
+	}
+	if in.Mode != nil {
+		next.Mode, next.UIDs = normalize(*in.Mode, next.UIDs)
+	}
+	if in.UIDs != nil {
+		next.Mode, next.UIDs = normalize(next.Mode, *in.UIDs)
+	}
+	if in.ExpiresAt != nil {
+		next.ExpiresAt = *in.ExpiresAt
+	}
+	if in.Enabled != nil {
+		next.Enabled = *in.Enabled
+	}
+	s.replaceLocked(old, &next)
+	if err := s.saveLocked(); err != nil {
+		return View{}, err
+	}
+	return next.view(), nil
+}
+
+// Rotate 轮换明文：换 Hash/Prefix，保留 ID/Name/绑定/开关/过期/统计。
+func (s *Store) Rotate(id string) (View, string, error) {
+	plain, err := newPlaintext()
+	if err != nil {
+		return View{}, "", err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cur := s.snap.Load()
+	old, ok := findLocked(cur, id)
+	if !ok {
+		return View{}, "", ErrNotFound
+	}
+	next := *old
+	next.Hash = HashToken(plain)
+	next.Prefix = plain[:11] + "…"
+	s.replaceLocked(old, &next)
+	if err := s.saveLocked(); err != nil {
+		return View{}, "", err
+	}
+	return next.view(), plain, nil
+}
+
+// Remove 删除一把密钥。
+func (s *Store) Remove(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cur := s.snap.Load()
+	if _, ok := findLocked(cur, id); !ok {
+		return ErrNotFound
+	}
+	byHash := make(map[string]*Key, len(cur.byHash))
+	for h, v := range cur.byHash {
+		if v.ID == id {
+			continue
+		}
+		byHash[h] = v
+	}
+	list := make([]*Key, 0, len(cur.list))
+	for _, v := range cur.list {
+		if v.ID == id {
+			continue
+		}
+		list = append(list, v)
+	}
+	s.snap.Store(&Snapshot{byHash: byHash, list: list})
+	return s.saveLocked()
+}
+
+// findLocked 按 ID 在快照里查（密钥数量有界，线性扫描足够且省一层索引维护）。
+func findLocked(snap *Snapshot, id string) (*Key, bool) {
+	if snap == nil {
+		return nil, false
+	}
+	for _, k := range snap.list {
+		if k.ID == id {
+			return k, true
+		}
+	}
+	return nil, false
+}
+
+// replaceLocked 用 next 替换 old（按 ID 同时更新 byHash 与 list），旧明文摘要同步移除。
+func (s *Store) replaceLocked(old, next *Key) {
+	cur := s.snap.Load()
+	byHash := make(map[string]*Key, len(cur.byHash))
+	for h, v := range cur.byHash {
+		if v.ID == old.ID {
+			continue
+		}
+		byHash[h] = v
+	}
+	byHash[next.Hash] = next
+	list := make([]*Key, 0, len(cur.list))
+	for _, v := range cur.list {
+		if v.ID == old.ID {
+			list = append(list, next)
+			continue
+		}
+		list = append(list, v)
+	}
+	s.snap.Store(&Snapshot{byHash: byHash, list: list})
+}
+
 // ensureDir 确保父目录存在。
 func ensureDir(path string) error {
 	dir := filepath.Dir(path)
