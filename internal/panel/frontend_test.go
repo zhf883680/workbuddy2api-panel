@@ -903,3 +903,25 @@ process.stdout.write(JSON.stringify({
 			strings.TrimSpace(string(out)), want)
 	}
 }
+
+// 请求记录的「密钥」列必须存在于 HTML 表头与 JS 渲染里（spec §7.3 / AC7），
+// 且列数（表头 11 列 / 空态 colspan）保持一致——否则表格会错位。
+func TestFrontendRequestLogKeyColumn(t *testing.T) {
+	p := newTestPanel()
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, httptest.NewRequest("GET", "/panel/", nil))
+	body := rec.Body.String()
+	if !strings.Contains(body, "<th>密钥</th>") {
+		t.Fatal("index.html 请求记录表头缺少「密钥」列")
+	}
+	raw, err := os.ReadFile("app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	js := string(raw)
+	for _, want := range []string{"function keyCell", "keyCell(e)", `colspan="11"`} {
+		if !strings.Contains(js, want) {
+			t.Fatalf("app.js 缺少 %q", want)
+		}
+	}
+}

@@ -223,6 +223,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Request-Id", trace.id)
 		h.cfg.RequestLog.Begin()
 		defer func() {
+			// 身份在 withAuth 内写入盒子；此处（handler 返回后）读取，happens-before 成立。
+			trace.identity = identityFrom(r)
 			status := obs.status
 			if status == 0 {
 				status = http.StatusOK
@@ -674,6 +676,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// allowed 非 nil 即"绑定模式"，候选集被限制在绑定账号内，全不可用时 503 而非借号。
 	id := identityFrom(r)
 	allowed := id.AllowedUIDs()
+	// 流水行在本函数返回前打印（早于 ServeHTTP 的 trace defer），故身份在这里就给 st。
+	st.identity = id
 
 	tried := map[string]bool{}
 	var lastErr error
@@ -802,6 +806,14 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				TokensPerSecond:  delta.TokensPerSecond,
 				HasTPS:           delta.HasTokensPerSecond,
 			}, delta.HasTotalTokens || delta.HasCompletionTokens || delta.HasPromptTokens)
+		}
+		// 分发密钥的累计用量：与 Usage.Add 同一处、同一口径（每次上游尝试各记一次，
+		// 重试与失败都计），因此面板密钥表格的列名标注为「调用（含重试）」。
+		// 根密钥（Root）不计数——它不是被分发的对象。
+		if h.cfg.Keys != nil && !id.Root {
+			h.cfg.Keys.NoteUsage(id.KeyID,
+				delta.HasTotalTokens || delta.HasCompletionTokens || delta.HasPromptTokens,
+				delta.PromptTokens, delta.CompletionTokens)
 		}
 	}
 
