@@ -365,6 +365,9 @@ type requestTrace struct {
 	id    string
 	start time.Time
 	stat  *chatStat
+	// path 本次请求的实际端点（/v1/chat/completions 或 /v1/responses）。
+	// 空串回落到 /v1/chat/completions：兼容既有直接构造 requestTrace 的调用方与测试。
+	path string
 	// identity 本次请求的调用方身份（withAuth 写入，ServeHTTP 的 defer 采集）：
 	// 供归档事件与 stdout 流水行标注"这条请求是谁打进来的"。
 	identity Identity
@@ -420,10 +423,14 @@ func requestTraceFrom(r *http.Request) *requestTrace {
 }
 
 func (t *requestTrace) event(status int) reqlog.Event {
+	path := t.path
+	if path == "" {
+		path = "/v1/chat/completions"
+	}
 	e := reqlog.Event{
 		Time:      t.start,
 		RequestID: t.id,
-		Path:      "/v1/chat/completions",
+		Path:      path,
 		Status:    status,
 	}
 	duration := time.Since(t.start)

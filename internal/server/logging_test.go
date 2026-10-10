@@ -503,3 +503,18 @@ func TestLogChatRowKeyField(t *testing.T) {
 		t.Errorf("empty identity must not add key field:\n%s", legacy)
 	}
 }
+
+// 请求日志的 path 必须记录实际端点：/v1/responses 与 /v1/chat/completions 要分得开
+// （否则运行日志与归档里两种协议混在一起，排障时无法区分）。
+func TestRequestLogPathIsActualPath(t *testing.T) {
+	tr := &requestTrace{id: "r1", start: time.Now(), path: "/v1/responses"}
+	if got := tr.event(200).Path; got != "/v1/responses" {
+		t.Fatalf("path = %q，want /v1/responses", got)
+	}
+	// path 缺省（既有调用方/测试直接构造 requestTrace）时回落到 chat 路径，
+	// 保证既有行为与既有测试零漂移。
+	tr2 := &requestTrace{id: "r2", start: time.Now()}
+	if got := tr2.event(200).Path; got != "/v1/chat/completions" {
+		t.Fatalf("缺省 path = %q，want /v1/chat/completions", got)
+	}
+}
