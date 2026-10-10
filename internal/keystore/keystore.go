@@ -10,6 +10,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -387,8 +388,125 @@ func ensureDir(path string) error {
 	return os.MkdirAll(dir, 0o755)
 }
 
-// load 读取 keys.json；文件不存在 = 空表（Task 3 实现）。
-func (s *Store) load() error { return nil }
+// file 落盘结构。
+type file struct {
+	Version int    `json:"version"`
+	Keys    []*Key `json:"keys"`
+}
 
-// saveLocked 原子落盘；调用方必须已持 s.mu（Task 3 实现）。
-func (s *Store) saveLocked() error { return nil }
+// fileVersion 当前格式版本。
+const fileVersion = 1
+
+// load 读取 keys.json；文件不存在 = 空表（不是错误）。
+func (s *Store) load() error {
+	raw, err := os.ReadFile(s.path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("keystore: read %s: %w", s.path, err)
+	}
+	if len(raw) == 0 {
+		return nil
+	}
+	var f file
+	if err := json.Unmarshal(raw, &f); err != nil {
+		return fmt.Errorf("keystore: parse %s: %w", s.path, err)
+	}
+	byHash := make(map[string]*Key, len(f.Keys))
+	list := make([]*Key, 0, len(f.Keys))
+	for _, k := range f.Keys {
+		if k == nil || k.ID == "" || k.Hash == "" {
+			continue // 非法条目直接跳过：坏一条不该让整个网关起不来
+		}
+		k.Mode, k.UIDs = normalize(k.Mode, k.UIDs)
+		byHash[k.Hash] = k
+		list = append(list, k)
+	}
+	sort.SliceStable(list, func(i, j int) bool { return list[i].CreatedAt < list[j].CreatedAt })
+	s.snap.Store(&Snapshot{byHash: byHash, list: list})
+	return nil
+}
+
+// saveLocked 原子落盘（tmp + rename，权限 0600）；调用方必须已持 s.mu。
+func (s *Store) saveLocked() error {
+	snap := s.snap.Load()
+	f := file{Version: fileVersion, Keys: snap.list}
+	raw, err := json.MarshalIndent(f, "", "  ")
+	if err != nil {
+		return fmt.Errorf("keystore: marshal: %w", err)
+	}
+	if err := ensureDir(s.path); err != nil {
+		return fmt.Errorf("keystore: mkdir: %w", err)
+	}
+	tmp := s.path + ".tmp"
+	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+		return fmt.Errorf("keystore: write tmp: %w", err)
+	}
+	if err := os.Rename(tmp, s.path); err != nil {
+		return fmt.Errorf("keystore: rename: %w", err)
+	}
+	s.dirty.Store(false)
+	return nil
+}
+
+// NoteUsage 累计一次上游尝试的用量（与 internal/usage 同口径：重试与失败都计）。
+func (s *Store) NoteUsage(id string, ok bool, promptTokens, completionTokens int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cur := s.snap.Load()
+	old, found := findLocked(cur, id)
+	if !found {
+		return
+	}
+	next := *old
+	next.Usage.Req++
+	if !ok {
+		next.Usage.Err++
+	}
+	next.Usage.PromptTokens += promptTokens
+	next.Usage.CompletionTokens += completionTokens
+	next.LastUsedAt = s.now().Unix()
+	s.replaceLocked(old, &next)
+	s.dirty.Store(true)
+}
+
+// Save 立即落盘（进程退出前调用）。
+func (s *Store) Save() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.saveLocked()
+}
+
+// Start 启动防抖刷盘 goroutine（幂等）。keys.json 未变时不写盘。
+func (s *Store) Start() {
+	s.startOnce.Do(func() {
+		go func() {
+			defer close(s.doneCh)
+			t := time.NewTicker(s.flushEvery)
+			defer t.Stop()
+			for {
+				select {
+				case <-s.stopCh:
+					return
+				case <-t.C:
+					if !s.dirty.Load() {
+						continue
+					}
+					_ = s.Save()
+				}
+			}
+		}()
+	})
+}
+
+// Stop 停止刷盘并强制落盘一次（幂等）。
+func (s *Store) Stop() {
+	s.stopOnce.Do(func() {
+		close(s.stopCh)
+		<-s.doneCh
+		if s.dirty.Load() {
+			_ = s.Save()
+		}
+	})
+}
