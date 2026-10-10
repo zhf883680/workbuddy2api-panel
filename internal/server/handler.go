@@ -201,6 +201,9 @@ func NewHandler(cfg Config) *Handler {
 	}
 	h := &Handler{cfg: cfg, mux: http.NewServeMux()}
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(scopeDataPlane, h.chatCompletions))
+	// OpenAI Responses 端点：同一 scope（根密钥 + 分发密钥都可用），协议翻译复用
+	// CLIProxyAPI 翻译器，代理行为复用 chatCompletions（见 responses.go）。
+	h.mux.HandleFunc("POST /v1/responses", h.withAuth(scopeDataPlane, h.responses))
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(scopeDataPlane, h.models))
 	h.mux.HandleFunc("GET /status", h.withAuth(scopeManagement, h.status))
 	h.mux.HandleFunc("GET /healthz", h.healthz)
@@ -213,7 +216,8 @@ func NewHandler(cfg Config) *Handler {
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// 身份盒子：withAuth 填写，handler 与外层 trace defer 读取。
 	r = r.WithContext(context.WithValue(r.Context(), identityBoxKey{}, &identityBox{}))
-	if h.cfg.RequestLog != nil && r.Method == http.MethodPost && r.URL.Path == "/v1/chat/completions" {
+	if h.cfg.RequestLog != nil && r.Method == http.MethodPost &&
+		(r.URL.Path == "/v1/chat/completions" || r.URL.Path == "/v1/responses") {
 		trace := &requestTrace{id: reqlog.NewRequestID(), start: time.Now()}
 		if h.loadLive().RecordClientInfo {
 			trace.captureClientInfo(r)
