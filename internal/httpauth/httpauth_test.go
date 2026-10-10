@@ -59,3 +59,19 @@ func TestDigestIsFixedLength(t *testing.T) {
 		t.Errorf("sha256 digest length = %d, want 32", len(digest("x")))
 	}
 }
+
+func TestBearerToken(t *testing.T) {
+	if _, ok := BearerToken(req("")); ok {
+		t.Fatal("无头应返回 ok=false")
+	}
+	if _, ok := BearerToken(req("Basic abc")); ok {
+		t.Fatal("非 Bearer 方案应返回 ok=false")
+	}
+	if _, ok := BearerToken(req("Bearer ")); ok {
+		t.Fatal("空令牌应返回 ok=false")
+	}
+	tok, ok := BearerToken(req("Bearer sk-abc"))
+	if !ok || tok != "sk-abc" {
+		t.Fatalf("BearerToken = %q/%v", tok, ok)
+	}
+}

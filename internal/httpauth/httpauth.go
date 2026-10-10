@@ -26,14 +26,30 @@ func VerifyBearer(r *http.Request, key string) bool {
 	if key == "" {
 		return true
 	}
-	authz := r.Header.Get("Authorization")
-	if !strings.HasPrefix(authz, bearerPrefix) {
+	tok, ok := BearerToken(r)
+	if !ok {
 		// 缺头/方案不对：仍走一次摘要比较，保持耗时形状一致。
 		subtle.ConstantTimeCompare(digest(""), digest(key))
 		return false
 	}
-	tok := authz[len(bearerPrefix):]
 	return subtle.ConstantTimeCompare(digest(tok), digest(key)) == 1
+}
+
+// BearerToken 提取 Authorization 头里的 Bearer 令牌原文。
+//
+// 用途：keystore 需要拿明文算摘要查表（sha256 摘要索引），必须拿到原文。
+// **校验仍必须走 VerifyBearer**（常量时间比较）；本函数只做取值，不承担安全判定，
+// 调用方不得用它的结果做相等判断。
+func BearerToken(r *http.Request) (string, bool) {
+	authz := r.Header.Get("Authorization")
+	if !strings.HasPrefix(authz, bearerPrefix) {
+		return "", false
+	}
+	tok := authz[len(bearerPrefix):]
+	if tok == "" {
+		return "", false
+	}
+	return tok, true
 }
 
 // digest 返回 s 的 SHA-256（定长 32 字节，供常量时间比较）。
