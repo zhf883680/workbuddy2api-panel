@@ -968,3 +968,25 @@ func TestDNSServersConfigAndEnv(t *testing.T) {
 		t.Fatalf("缺省应为空（系统解析器）：%v", c3.DNSServers)
 	}
 }
+
+func TestKeysFileDefaultsAndEnv(t *testing.T) {
+	c := Default()
+	if c.KeysFile != "" {
+		t.Fatalf("默认应为空（= state 同目录 keys.json），得到 %q", c.KeysFile)
+	}
+	t.Setenv("WB2A_KEYS_FILE", "/tmp/keys-test.json")
+	c2 := Default()
+	applyEnv(c2)
+	if c2.KeysFile != "/tmp/keys-test.json" {
+		t.Fatalf("WB2A_KEYS_FILE 未生效: %q", c2.KeysFile)
+	}
+	// JSON 往返：显式配置能读回。
+	raw := []byte(`{"state_file":"./data/state.json","keys_file":"./data/my-keys.json"}`)
+	c3, err := ParseConfig(raw)
+	if err != nil {
+		t.Fatalf("ParseConfig: %v", err)
+	}
+	if c3.KeysFile != "./data/my-keys.json" {
+		t.Fatalf("keys_file 未解析: %q", c3.KeysFile)
+	}
+}

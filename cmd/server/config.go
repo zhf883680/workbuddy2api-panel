@@ -23,6 +23,10 @@ type Config struct {
 	APIKey    string `json:"api_key"`    // 空 = 不鉴权
 	AuthDir   string `json:"auth_dir"`   // ./auths
 	StateFile string `json:"state_file"` // ./data/state.json
+	// KeysFile 分发密钥存储文件；空 = 与 state_file 同目录的 keys.json。
+	// 密钥是运行期数据（面板随时增删改），与 config.json 的人改配置分离：
+	// 走独立的原子读写，不受配置保存链路影响。
+	KeysFile string `json:"keys_file"`
 
 	// DNSServers 出站解析用的 DNS 服务器（空 = 用系统解析器）；也可用 WB2A_DNS 覆盖
 	// （逗号分隔）。给没有 /etc/resolv.conf 的环境用：Android 上 Go 的解析器会退回
@@ -498,6 +502,9 @@ func applyEnv(c *Config) {
 	}
 	if v := os.Getenv("WB2A_DNS"); v != "" {
 		c.DNSServers = splitCSV(v)
+	}
+	if v := os.Getenv("WB2A_KEYS_FILE"); v != "" {
+		c.KeysFile = v
 	}
 	if v := os.Getenv("WB2A_SOFT_RATE"); v != "" {
 		c.Cooldown.SoftRate = v
