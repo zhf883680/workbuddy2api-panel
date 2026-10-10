@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"net"
 	"net/http"
 	"os"
 	"strings"
@@ -16,9 +15,9 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/loginlock"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/reqlog"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
 
 // maxUserAgentLen 归档与面板展示保留的 UA 字节上限。UA 是客户端完全可控的
@@ -450,25 +449,14 @@ func (t *requestTrace) captureClientInfo(r *http.Request) {
 	t.userAgent = logfmt.Truncate(r.UserAgent(), maxUserAgentLen)
 }
 
-// clientIPForLog 提取用于日志展示的客户端 IP。
+// clientIPForLog 提取用于日志展示的客户端 IP（实现见 loginlock.ClientKey）。
 //
 // 与 upstream.ExtractClientIP 的差别：后者只认代理头（X-Forwarded-For 首段 →
 // X-Real-IP），因为它的用途是把客户端 IP **透传给上游**，回落到网关自身地址会
-// 污染上游风控判据；日志场景相反——直连（无反代）时 RemoteAddr 就是唯一线索，
-// 必须回落，否则面板里所有来源都显示 "-"。代理头优先保证反代后拿到真实客户端。
-func clientIPForLog(r *http.Request) string {
-	if r == nil {
-		return ""
-	}
-	if ip := upstream.ExtractClientIP(r); ip != "" {
-		return ip
-	}
-	host, _, err := net.SplitHostPort(strings.TrimSpace(r.RemoteAddr))
-	if err != nil {
-		return strings.TrimSpace(r.RemoteAddr)
-	}
-	return host
-}
+// 污染上游风控判据；日志与鉴权失败记账场景相反——直连（无反代）时 RemoteAddr
+// 就是唯一线索，必须回落，否则面板里所有来源都显示 "-"、锁定也退化成单桶。
+// 代理头优先（反代后拿到真实客户端），故直接复用同一实现，避免两处口径漂移。
+func clientIPForLog(r *http.Request) string { return loginlock.ClientKey(r) }
 
 // dashIfEmpty 空串统一显示 "-"（来源字段未采集时不留空白列）。
 func dashIfEmpty(s string) string {

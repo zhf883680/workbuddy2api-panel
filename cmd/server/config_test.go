@@ -22,6 +22,76 @@ func TestDefault(t *testing.T) {
 	}
 }
 
+// 登录失败锁定（security.login_lockout）：缺省开启（5 次 / 5m 窗口 / 锁 10m），
+// 显式配置生效，时长写错 fail fast（静默当成关闭会让人以为锁已生效）。
+func TestLoginLockoutConfig(t *testing.T) {
+	def, err := ParseConfig([]byte(`{}`))
+	if err != nil {
+		t.Fatalf("ParseConfig: %v", err)
+	}
+	p := def.LoginLockoutPolicy
+	if !p.Active() || p.MaxFails != 5 || p.Window != 5*time.Minute || p.LockDuration != 10*time.Minute {
+		t.Fatalf("默认策略 = %+v，want 5 次 / 5m / 10m 且启用", p)
+	}
+
+	// 显式配置：值照抄，enabled=false 关停。
+	c, err := ParseConfig([]byte(`{"security":{"login_lockout":{"enabled":false,"max_fails":3,"window":"60s","lock_duration":"2m"}}}`))
+	if err != nil {
+		t.Fatalf("ParseConfig: %v", err)
+	}
+	if c.LoginLockoutPolicy.Active() {
+		t.Fatal("enabled=false 应关闭锁定")
+	}
+	if c.LoginLockoutPolicy.MaxFails != 3 || c.LoginLockoutPolicy.Window != time.Minute || c.LoginLockoutPolicy.LockDuration != 2*time.Minute {
+		t.Fatalf("显式策略 = %+v", c.LoginLockoutPolicy)
+	}
+
+	// 空值回落默认（Default 已置值，此处覆盖显式 ""）。
+	empty, err := ParseConfig([]byte(`{"security":{"login_lockout":{"window":"","lock_duration":""}}}`))
+	if err != nil {
+		t.Fatalf("空值不应报错: %v", err)
+	}
+	if empty.LoginLockoutPolicy.Window != 5*time.Minute || empty.LoginLockoutPolicy.LockDuration != 10*time.Minute {
+		t.Fatalf("空值应回落默认，got %+v", empty.LoginLockoutPolicy)
+	}
+
+	// 非法/非正时长：fail fast 并指向开关（不静默把保护关掉）。
+	for _, raw := range []string{
+		`{"security":{"login_lockout":{"window":"5x"}}}`,
+		`{"security":{"login_lockout":{"lock_duration":"0s"}}}`,
+		`{"security":{"login_lockout":{"window":"-5m"}}}`,
+	} {
+		if _, err := ParseConfig([]byte(raw)); err == nil {
+			t.Errorf("%s 应报错（非法时长必须 fail fast）", raw)
+		}
+	}
+	// max_fails<=0 回落默认 5（同 package_detail_limit 口径）。
+	zero, err := ParseConfig([]byte(`{"security":{"login_lockout":{"max_fails":0}}}`))
+	if err != nil {
+		t.Fatalf("ParseConfig: %v", err)
+	}
+	if zero.LoginLockoutPolicy.MaxFails != 5 {
+		t.Fatalf("max_fails<=0 应回落 5，got %d", zero.LoginLockoutPolicy.MaxFails)
+	}
+}
+
+// 生成的默认配置必须带上 security 段（面板配置页按 schema 回填，缺段会让四项全空）。
+func TestWriteDefaultIncludesLoginLockout(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	if _, err := WriteDefault(path); err != nil {
+		t.Fatalf("WriteDefault: %v", err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`"security"`, `"login_lockout"`, `"max_fails": 5`, `"window": "5m"`, `"lock_duration": "10m"`} {
+		if !strings.Contains(string(raw), want) {
+			t.Errorf("默认配置缺 %s", want)
+		}
+	}
+}
+
 func TestPanelPackageDetailLimit(t *testing.T) {
 	c := Default()
 	if err := c.normalize(); err != nil {

@@ -36,7 +36,7 @@ func TestSaveConfigReportsActualAndPendingRestarts(t *testing.T) {
 	sch := scheduler.New(scheduler.Config{Pool: p, Upstream: up})
 	save := func(body string) []string {
 		t.Helper()
-		fields, err := saveConfig([]byte(body), path, live, p, up, sch, nil, nil, cfg)
+		fields, err := saveConfig([]byte(body), path, live, p, up, sch, nil, nil, nil, cfg)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -89,7 +89,7 @@ func TestSaveConfigWhenDirNotWritable(t *testing.T) {
 	defer p.Close()
 	up := upstream.New()
 	sch := scheduler.New(scheduler.Config{Pool: p, Upstream: up})
-	if _, err := saveConfig([]byte(`{"api_key":"changed-in-place"}`), path, live, p, up, sch, nil, nil, cfg); err != nil {
+	if _, err := saveConfig([]byte(`{"api_key":"changed-in-place"}`), path, live, p, up, sch, nil, nil, nil, cfg); err != nil {
 		t.Fatalf("目录不可写时应原地重写而不是报错: %v", err)
 	}
 	if live.Load().APIKey != "changed-in-place" {
@@ -151,7 +151,7 @@ func TestSaveConfigRetainsEnvironmentManagedKey(t *testing.T) {
 	defer p.Close()
 	up := upstream.New()
 	sch := scheduler.New(scheduler.Config{Pool: p, Upstream: up})
-	fields, err := saveConfig([]byte(`{"api_key":"submitted-key"}`), path, live, p, up, sch, nil, nil, cfg)
+	fields, err := saveConfig([]byte(`{"api_key":"submitted-key"}`), path, live, p, up, sch, nil, nil, nil, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}

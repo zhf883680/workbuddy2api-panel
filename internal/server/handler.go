@@ -23,6 +23,7 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/keystore"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/loginlock"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/prompt"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/reqlog"
@@ -92,6 +93,11 @@ type Config struct {
 	CacheLowRate float64
 	// RequestLog 请求指标与脱敏 JSONL 归档（可选；nil = 不记录）。
 	RequestLog *reqlog.Recorder
+
+	// LoginLockout 鉴权失败锁定（可选；nil = 关闭，行为与既有版本一致）。
+	// 与面板共用同一实例（main 装配）：同一个 api_key 的枚举面覆盖 /v1、/status
+	// 与 /panel/*，分开记账等于给攻击者留一条免锁旁路。
+	LoginLockout *loginlock.Limiter
 
 	// Keys 分发密钥存储（可选；nil = 未启用密钥体系，行为与只有根密钥时一致）。
 	// 面板签发、server 校验，同一实例注入（main 装配），改密钥下一个请求即生效。
@@ -324,10 +330,31 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 //   - scopeManagement：仅根密钥（分发密钥一律 401，避免把管理面暴露给被分发方）。
 //
 // api_key 为空 = 不鉴权部署：恒根身份，行为与既有实现完全一致。
+//
+// 鉴权失败记账（loginlock，等保「登录失败处理」）：键为来源 IP，超过阈值即
+// 429 + Retry-After，锁定期内一律拒绝（含正确密钥），到期自动放行。
 func (h *Handler) withAuth(scope authScope, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		lock := h.cfg.LoginLockout
+		lockKey := ""
+		// 未启用鉴权时不记账：此时 authenticate 恒放行，没有任何"失败"可谈。
+		if h.loadLive().APIKey != "" && lock.Enabled() {
+			lockKey = loginlock.ClientKey(r)
+			if ok, retry := lock.Allow(lockKey); !ok {
+				writeAuthLocked(w, retry)
+				return
+			}
+		}
 		id, code := h.authenticate(r, scope)
 		if code != "" {
+			if lockKey != "" && mayCountAsFailure(code) {
+				if locked, retry := lock.Fail(lockKey); locked {
+					log.Printf("[auth] 来源 %s 鉴权失败次数超限，锁定 %d 秒（%s %s）",
+						lockKey, loginlock.SecondCeil(retry), r.Method, r.URL.Path)
+					writeAuthLocked(w, retry)
+					return
+				}
+			}
 			writeOpenAIError(w, http.StatusUnauthorized, code, authErrorMessage(code))
 			return
 		}
@@ -349,6 +376,26 @@ func authErrorMessage(code string) string {
 	default:
 		return "missing or invalid API key"
 	}
+}
+
+// mayCountAsFailure 报告某个鉴权错误码是否计入失败次数。
+//
+// 只记 invalid_api_key（凭据不匹配 = 枚举/配置错误的信号）：api_key_disabled /
+// api_key_expired 是"有效分发密钥被停用/过期"，持有者不是枚举者——把它们计入会
+// 让正常的密钥轮换把调用方整体锁在门外。
+func mayCountAsFailure(code string) bool { return code == "invalid_api_key" }
+
+// writeAuthLocked 来源被临时锁定的响应：429 + Retry-After（秒）。
+//
+// 用 429 而不是继续 401：调用方/编排层要能区分"密钥不对"（改密钥）与"被限流"
+// （等待）——两者都是 401 时只会让人反复重试并把锁越撞越死。
+func writeAuthLocked(w http.ResponseWriter, retry time.Duration) {
+	sec := loginlock.SecondCeil(retry)
+	if sec > 0 {
+		w.Header().Set("Retry-After", strconv.Itoa(sec))
+	}
+	writeOpenAIError(w, http.StatusTooManyRequests, "too_many_failed_attempts",
+		fmt.Sprintf("too many failed authentication attempts; retry after %d second(s)", sec))
 }
 
 // authenticate 判定请求身份；返回的 code 非空表示拒绝（调用方回 401）。

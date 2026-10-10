@@ -25,6 +25,7 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/credithist"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/keystore"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/loginlock"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/panel"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/redisstore"
@@ -321,6 +322,16 @@ func main() {
 		log.Printf("[reqlog] 请求指标已启用；JSONL 归档已关闭")
 	}
 
+	// 鉴权失败锁定（等保「登录失败处理」）：单一实例同时注入面板与网关——
+	// 同一个 api_key 的枚举面是同一件事，两边分开记账等于留一条免锁旁路。
+	loginLock := loginlock.New(cfg.LoginLockoutPolicy)
+	if cfg.LoginLockoutPolicy.Active() {
+		log.Printf("[security] 鉴权失败锁定已启用：%d 次 / %s 内 → 锁 %s（按来源 IP，覆盖面板与 /v1）",
+			cfg.LoginLockoutPolicy.MaxFails, cfg.LoginLockoutPolicy.Window, cfg.LoginLockoutPolicy.LockDuration)
+	} else {
+		log.Printf("[security] 鉴权失败锁定已关闭（security.login_lockout.enabled=false）")
+	}
+
 	var gw *server.Handler
 	// configSaveMu 串行化面板配置保存（并发两次保存会在读-改-写文件与热应用之间互踩）。
 	var configSaveMu sync.Mutex
@@ -349,6 +360,7 @@ func main() {
 		StickyCount:      sessCount,
 		Version:          appVersion,
 		Live:             live,
+		LoginLockout:     loginLock,
 		// 模型上限探测数据（scripts/probe_max_tokens.py --panel-out 写入）：
 		// 与 state 文件同目录，缺省 data/output_probes.json。
 		ProbeFile:  stateSibling(cfg.StateFile, "output_probes.json"),
@@ -359,7 +371,7 @@ func main() {
 		SaveConfig: func(raw []byte) ([]string, error) {
 			configSaveMu.Lock()
 			defer configSaveMu.Unlock()
-			return saveConfig(raw, *cfgPath, live, p, up, sch, gw, pn, cfg)
+			return saveConfig(raw, *cfgPath, live, p, up, sch, gw, pn, loginLock, cfg)
 		},
 		// 积分历史账本（只读展示；写入由上面的余额观察者完成）。
 		CreditHistory: creditHist,
@@ -397,6 +409,7 @@ func main() {
 		Live:         live,
 		Usage:        rec,
 		RequestLog:   requestLog,
+		LoginLockout: loginLock,
 		PromptMode:   cfg.Prompt.Mode,
 		PromptText:   cfg.PromptText,
 		// 来源记录开关经 livecfg 热生效；此处同时填静态字段，供 Live 为 nil 的
@@ -576,6 +589,7 @@ func panelListenPath(listen string) string {
 // 热生效范围（设计取舍）：
 //   - api_key / cooldown.soft_rate / features.sanitize_blacklist_fingerprints → livecfg 快照
 //   - pool.* → pool.SetBreaker/SetMaxInFlight/SetSoftRateMax/SetWeights/SetCostExploreInterval/SetPreferExpiring（含快过期窗口）/SetAccountPriority/SetAccountShare/SetCreditFloor
+//   - security.login_lockout → loginlock.Limiter.SetPolicy
 //   - schedule.* → scheduler.Reconfigure/SetBalanceInterval/SetExpiringSoonWindow
 //
 // 需重启（涉及监听地址、HTTP client 超时、auth_dir 等装配期依赖）：
@@ -603,7 +617,7 @@ func writeConfigInPlace(path string, out []byte) error {
 	return werr
 }
 
-func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up *upstream.Client, sch *scheduler.Scheduler, gw *server.Handler, pn *panel.Panel, running ...*Config) ([]string, error) {
+func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up *upstream.Client, sch *scheduler.Scheduler, gw *server.Handler, pn *panel.Panel, loginLock *loginlock.Limiter, running ...*Config) ([]string, error) {
 	// 1) 解析原始 JSON 为 map（保留用户手写的未知键），再叠加面板提交的键。
 	oldRaw, err := os.ReadFile(path)
 	if err != nil {
@@ -679,6 +693,9 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 		HiddenModels:         livecfg.NormalizeHiddenModels(newCfg.Models.Hidden),
 		ModelAliases:         livecfg.NormalizeModelAliases(newCfg.Models.Aliases),
 	})
+	if loginLock != nil {
+		loginLock.SetPolicy(newCfg.LoginLockoutPolicy) // 登录失败锁定策略热生效
+	}
 	up.SanitizeFingerprints.Store(newCfg.Features.SanitizeBlacklistFingerprints)
 	p.SetBreaker(newCfg.Pool.BreakerThreshold, newCfg.BreakerCooldownDur, newCfg.BreakerCooldownMaxD)
 	p.SetMaxInFlight(newCfg.Pool.MaxInFlight)

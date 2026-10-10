@@ -11,6 +11,14 @@
   "panel": {
     "package_detail_limit": 5
   },
+  "security": {
+    "login_lockout": {
+      "enabled": true,
+      "max_fails": 5,
+      "window": "5m",
+      "lock_duration": "10m"
+    }
+  },
   "logging": {
     "request_archive_enabled": true,
     "request_retention_days": 7,
