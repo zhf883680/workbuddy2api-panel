@@ -107,7 +107,16 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 
 ## 🆚 与上游的差异
 
-本分支相对 [上游 master](https://github.com/Sliverkiss/workbuddy2api) 的增量（均已在真实多账号环境验证）：
+当前仓库是 [misakano7545/workbuddy2api-panel](https://github.com/misakano7545/workbuddy2api-panel) 的 fork。2026-10-21 已合入其 `main` 最新提交 `2892e6a`，同时保留本 fork 的分发密钥、登录失败锁定与密钥落盘加固。下面的「新增」记录上游面板分支相对其原始上游的差异；本 fork 在合并后的额外能力单独列在下一节。
+
+### 本 fork 额外能力
+
+| 能力 | 说明 |
+|---|---|
+| **分发密钥体系** | 面板「密钥」页签发 / 编辑 / 启停 / 重置 / 删除独立于根密钥的分发密钥，存储于 `keys.json`（可用 `keys_file` / `WB2A_KEYS_FILE` 改路径）。每把密钥可选全局池或绑定指定账号；绑定模式严格限制候选集，绑定账号都不可用时直接 `503`，不会借用其他账号，粘性会话同样受约束。分发密钥只允许数据面 `/v1/*`，不能访问 `/status`、`/panel/api/*` 或 `/admin/*`；请求日志、用量统计和 stdout 流水行记录密钥名称与短 ID，不记录明文。 |
+| **登录失败锁定** | `internal/loginlock` 按来源 IP 累计鉴权失败；达到阈值后返回 `429 + Retry-After`。面板密钥门与网关共用同一个计数器和同一把根密钥的失败面。锁定期内即使密钥正确也拒绝，成功请求不清零；被禁用 / 过期的有效分发密钥不计为枚举失败。策略位于 `security.login_lockout`，可在面板热改，计数为进程内存态，重启即清空。 |
+| **密钥持久化健壮性** | `keys.json` 使用唯一临时文件原子写入；创建、更新、轮换、删除若落盘失败会回滚内存状态；防抖刷盘错误会显式记录。错误信息包含绝对路径、目录可写性、进程 uid/gid 与 `chown` / `PUID` 排查提示。 |
+| **密钥管理交互** | 面板提供绑定账号限高滚动列表、已选计数、全选 / 清空、过期时间与启停状态；密钥明文仅在创建或重置时显示一次。`401` / `429` 会停掉后台轮询并显示具体鉴权失败原因，避免旧密钥持续撞失败计数。 |
 
 ### 新增
 
@@ -379,6 +388,11 @@ curl -s http://localhost:7863/v1/responses \
 | `api_key` | 空 | 网关鉴权密钥；**空 = 不鉴权直接放行**（公网必须设置） |
 | `auth_dir` | `./auths` | 账号凭证目录 |
 | `state_file` | `./data/state.json` | 账号池状态持久化文件 |
+| `keys_file` | 空 | 分发密钥存储文件；空 = 与 `state_file` 同目录的 `keys.json`。可用 `WB2A_KEYS_FILE` 覆盖，改动需重启 |
+| `security.login_lockout.enabled` | `true` | 按来源 IP 的鉴权失败锁定，覆盖面板密钥门、`/status` 与 `/v1/*` |
+| `security.login_lockout.max_fails` | `5` | 窗口内允许的失败次数；达到即锁定并返回 `429` |
+| `security.login_lockout.window` | `5m` | 失败计数窗口（Go 时长） |
+| `security.login_lockout.lock_duration` | `10m` | 锁定持续时间；`Retry-After` 给出剩余秒数 |
 | `dns_servers` | `[]` | 出站解析用的 DNS 服务器（`["223.5.5.5","119.29.29.29"]`；也可用 `WB2A_DNS` 逗号分隔覆盖）。空 = 系统解析器。给没有 `/etc/resolv.conf` 的环境用（Android 上 Go 解析器会退回 `[::1]:53`，所有域名解析失败），本地 DNS 被污染时也可借此直连可信解析器。改动需重启 |
 | `server.read_timeout` | `300s` | 入站请求读取（含 body 上传）总时长上限；大上下文/文件块经反代转发超时会 400 `read body: i/o timeout`；`0` = 不限制；改动需重启（#100） |
 | `panel.package_detail_limit` | `5` | 积分构成页单账号默认展示的最早到期包数；其余未用完包与已用完包聚合折叠 |
