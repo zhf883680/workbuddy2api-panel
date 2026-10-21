@@ -16,6 +16,122 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
 
+// schedFor 只让 cfg 显式配了小时数的那几类参与：New 会给未配的补默认整点
+// （activity 10 点 / keepalive 22 点等），不静音就会把断言撑满与用例无关的类别。
+func schedFor(cfg Config) *Scheduler {
+	if len(cfg.CheckinHours) == 0 {
+		cfg.CheckinDisabled = true
+	}
+	if len(cfg.TravelHours) == 0 {
+		cfg.TravelDisabled = true
+	}
+	if len(cfg.ActivityHours) == 0 {
+		cfg.ActivityDisabled = true
+	}
+	if len(cfg.KeepaliveHours) == 0 {
+		cfg.KeepaliveDisabled = true
+	}
+	if len(cfg.BlackcatHours) == 0 {
+		cfg.BlackcatDisabled = true
+	}
+	if len(cfg.GrowthHours) == 0 {
+		cfg.GrowthDisabled = true
+	}
+	return New(cfg)
+}
+
+// 启动补跑（missedToday）：今天时点全过 → 补；今天还有更晚的时点 → 不补。
+func TestMissedToday(t *testing.T) {
+	cases := []struct {
+		name string
+		now  time.Time
+		cfg  Config
+		want []taskKind
+	}{
+		{"今天的时点已过 → 补", time.Date(2026, 10, 15, 10, 0, 0, 0, time.Local),
+			Config{CheckinHours: []int{9}}, []taskKind{taskCheckin}},
+		{"今天还有更晚的时点 → 不补（当天照常会跑，补跑是多余的）", time.Date(2026, 10, 15, 10, 0, 0, 0, time.Local),
+			Config{CheckinHours: []int{9, 21}}, nil},
+		{"时点还没到 → 不补", time.Date(2026, 10, 15, 10, 0, 0, 0, time.Local),
+			Config{CheckinHours: []int{11}}, nil},
+		{"禁用任务不进候选", time.Date(2026, 10, 15, 10, 0, 0, 0, time.Local),
+			Config{CheckinHours: []int{9}, CheckinDisabled: true, TravelHours: []int{8}}, []taskKind{taskTravel}},
+		{"多类一起补", time.Date(2026, 10, 15, 10, 0, 0, 0, time.Local),
+			Config{CheckinHours: []int{9}, TravelHours: []int{8}, KeepaliveHours: []int{7}, GrowthHours: []int{11}},
+			[]taskKind{taskCheckin, taskTravel, taskKeepalive}},
+		{"跨年：12/31 的时点已过 → 补", time.Date(2026, 12, 31, 10, 0, 0, 0, time.Local),
+			Config{CheckinHours: []int{1}}, []taskKind{taskCheckin}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := schedFor(c.cfg).missedToday(c.now)
+			if len(got) != len(c.want) {
+				t.Fatalf("missed=%v want %v", got, c.want)
+			}
+			for i := range got {
+				if got[i] != c.want[i] {
+					t.Fatalf("missed=%v want %v", got, c.want)
+				}
+			}
+		})
+	}
+}
+
+// nextWake 与 missedToday 必须共用同一套「有哪些任务族」口径：新增任务族漏改一处，
+// 排程或补跑会静默少一类（正是「同一件事两套纪律」那类缺口）。
+func TestEnabledSlotsSingleSourceOfTruth(t *testing.T) {
+	now := time.Date(2026, 10, 15, 10, 0, 0, 0, time.Local)
+	all := Config{
+		CheckinHours: []int{9}, TravelHours: []int{8}, ActivityHours: []int{7},
+		KeepaliveHours: []int{6}, BlackcatHours: []int{5}, GrowthHours: []int{4},
+	}
+	if got := New(all).enabledSlots(now); len(got) != 6 {
+		t.Fatalf("启用任务族应为 6 类，got %d: %v", len(got), got)
+	}
+	if got := New(all).missedToday(now); len(got) != 6 {
+		t.Fatalf("时点全过时 6 类都应补跑，got %v", got)
+	}
+}
+
+// Run 启动时必须真的把「今天已过时点」的任务补一轮（不只是算出来）。
+func TestRunCatchesUpMissedSlots(t *testing.T) {
+	f := &fakeUpstream{}
+	srv := f.server()
+	defer srv.Close()
+
+	p := pool.New("")
+	p.Add(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
+	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
+
+	// 取「今天已经过去」的整点：now 的上一小时（00:xx 时取 0 点，其 00:00 也已过）。
+	past := time.Now().Hour() - 1
+	if past < 0 {
+		past = 0
+	}
+	s := New(Config{
+		Pool: p, Upstream: up, CheckinHours: []int{past},
+		TravelDisabled: true, ActivityDisabled: true, KeepaliveDisabled: true,
+		BlackcatDisabled: true, GrowthDisabled: true,
+	})
+	old := wakeupGraceDelay
+	wakeupGraceDelay = 0 // 测试不等启动宽限
+	defer func() { wakeupGraceDelay = old }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go s.Run(ctx)
+
+	// 补跑在 Run 进入主循环之前派发；命中即退出，不等固定时长。
+	deadline := time.Now().Add(10 * time.Second)
+	for f.checkinCalls.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	if n := f.checkinCalls.Load(); n == 0 {
+		t.Fatal("启动补跑未触发签到（今天的时点已过，应补一轮）")
+	}
+}
+
 func TestNextFire(t *testing.T) {
 	loc := time.Local
 	now := time.Date(2026, 7, 27, 10, 0, 0, 0, loc)
@@ -128,6 +244,7 @@ func TestNextWakeBothDisabledNothingScheduled(t *testing.T) {
 		ActivityDisabled:  true,
 		KeepaliveDisabled: true,
 		BlackcatDisabled:  true,
+		GrowthDisabled:    true,
 		CheckinHours:      []int{9, 21},
 		KeepaliveHours:    []int{22},
 	})
@@ -213,16 +330,16 @@ func (f *fakeUpstream) server() *httptest.Server {
 			}
 			w.Write([]byte(`{"code":0,"data":{"Response":{"Data":{"Accounts":[{"CycleCapacitySize":1000,"CycleCapacityRemain":` +
 				jsonI64(f.resourceRemain) + `,"CycleCapacityUsed":0` + end + `}]}}}}`))
+		case strings.HasSuffix(r.URL.Path, "/buddy/info"):
+			// 有猫 → travelOne 继续查状态（nil 会转去领养流程，测不到状态调用）。
+			w.Write([]byte(`{"code":0,"data":{"buddy":{"id":1,"name":"cat"}}}`))
+		case strings.HasSuffix(r.URL.Path, "/travel/status"):
+			f.travelCalls.Add(1)
+			// traveling：只查状态、不发动作，一次账号一趟恰好一次状态调用。
+			w.Write([]byte(`{"code":0,"data":{"state":"traveling","record_id":7,"daily_limit_reached":false}}`))
 		case strings.HasSuffix(r.URL.Path, "/token/refresh"):
 			f.refreshCalls.Add(1)
 			w.Write([]byte(`{"code":0,"data":{"accessToken":"new","expiresIn":3600}}`))
-		case strings.HasSuffix(r.URL.Path, "/activity/growth/buddy/info"):
-			// 已领养（data.buddy 非空）：跳过领养前置，直接进旅行状态查询。
-			w.Write([]byte(`{"code":0,"data":{"buddy":{"id":1,"name":"cat"}}}`))
-		case strings.HasSuffix(r.URL.Path, "/activity/growth/buddy/travel/status"):
-			// daily_limit_reached=true：状态查询计一次调用即止，不发 depart/claim。
-			f.travelCalls.Add(1)
-			w.Write([]byte(`{"code":0,"data":{"state":"idle","daily_limit_reached":true}}`))
 		default:
 			http.Error(w, "not found", 404)
 		}
@@ -428,28 +545,6 @@ func TestRunBalanceRefreshNowUpdatesCreditsAndRevives(t *testing.T) {
 }
 
 // TestNextWakeGrowthSlot growth 排程进候选 + 禁用退场（每日自动执行成长任务队列）。
-func TestNextWakeGrowthSlot(t *testing.T) {
-	s := New(Config{GrowthHours: []int{1}})
-	at, kinds := s.nextWake(time.Date(2026, 9, 27, 0, 10, 0, 0, time.Local))
-	hasGrowth := false
-	for _, k := range kinds {
-		if k == taskGrowth {
-			hasGrowth = true
-		}
-	}
-	if !hasGrowth || at.Hour() != 1 || at.Day() != 27 {
-		t.Fatalf("growth 槽位: at=%v kinds=%v（期望 09-27 01:00 含 taskGrowth）", at, kinds)
-	}
-	// 禁用后不进候选（其余 kind 为空 → nextWake 零值返回）
-	s2 := New(Config{GrowthHours: []int{1}, GrowthDisabled: true})
-	_, kinds2 := s2.nextWake(time.Date(2026, 9, 27, 0, 10, 0, 0, time.Local))
-	for _, k := range kinds2 {
-		if k == taskGrowth {
-			t.Fatal("禁用后 growth 仍在候选")
-		}
-	}
-}
-
 func TestRunBalanceRefreshReplacesExpirySnapshot(t *testing.T) {
 	end := time.Now().In(time.FixedZone("CST", 8*3600)).Add(24 * time.Hour).Format("2006-01-02 15:04:05")
 	f := &fakeUpstream{resourceRemain: 100, resourceEnd: end}
@@ -588,22 +683,23 @@ func TestRunBalanceRefreshIncludesDisabledUpdatesCredits(t *testing.T) {
 	}
 }
 
-// TestSetIncludeDisabledInTasksHot setter 热更新立即生效（面板保存配置走这条路径）。
-func TestSetIncludeDisabledInTasksHot(t *testing.T) {
+// TestReconfigureIncludesDisabledInTasksHot 面板保存配置走 Reconfigure 热更新，
+// 开关立即生效（且不动其它排程参数）。
+func TestReconfigureIncludesDisabledInTasksHot(t *testing.T) {
 	f := &fakeUpstream{resourceRemain: 500}
 	srv := f.server()
 	defer srv.Close()
 
 	p := poolWithDisabledAccount()
 	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
-	s := New(Config{Pool: p, Upstream: up})
+	s := New(Config{Pool: p, Upstream: up, CheckinHours: []int{9, 21}})
 
 	s.RunCheckinNow()
 	if got := f.checkinCalls.Load(); got != 1 {
 		t.Fatalf("前置：缺省应只签 1 个，got %d", got)
 	}
 
-	s.SetIncludeDisabledInTasks(true)
+	s.Reconfigure(ScheduleParams{CheckinHours: []int{9, 21}, IncludeDisabledInTasks: true})
 	s.RunCheckinNow()
 	if got := f.checkinCalls.Load(); got != 3 {
 		t.Errorf("热更新后 checkin calls=%d want 3（1 + u1 + u2）", got)
@@ -674,10 +770,9 @@ func TestPausedVsDisabledTaskParticipation(t *testing.T) {
 	}
 }
 
-
-// TestPausedStillTravels 暂停号照常跑旅行：旅行是纯 RPC（状态/派出/领奖 +
-// 领养前置上报），不发模型对话，与「让位防风控」不冲突——唯一被跳过的
-// 对话类任务只有夜猫子（RunNightChats 真实 ChatStream）。
+// TestPausedStillTravels 暂停选号账号照常跑旅行：旅行是纯 RPC（状态 / 派出 / 领奖），
+// 不发模型对话，与「让位防风控」不冲突。锁住这条口径——上游曾把 paused 一并跳过，
+// 后在 b1a2284 撤回；本仓按修正后的口径实现。
 func TestPausedStillTravels(t *testing.T) {
 	f := &fakeUpstream{}
 	srv := f.server()
@@ -686,12 +781,35 @@ func TestPausedStillTravels(t *testing.T) {
 	p := pool.New("")
 	p.Add(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
 	p.Add(&auth.Auth{UID: "u2", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
-	p.Pause("u2")
+	if !p.Pause("u2") {
+		t.Fatal("Pause 失败")
+	}
 	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
 	s := New(Config{Pool: p, Upstream: up})
 
 	s.RunTravelNow()
 	if got := f.travelCalls.Load(); got != 2 {
-		t.Errorf("travel status calls=%d want 2（u1 + 暂停号 u2 照常旅行）", got)
+		t.Errorf("travel status calls=%d want 2（u1 + 暂停号 u2 都照常旅行）", got)
+	}
+}
+
+// TestBlackcatEligibility 夜猫子只跑非禁用、非暂停的账号：RunNightChats 逐条发真实
+// glm-5.2 对话，是任务体系里唯一「整任务都是模型对话」的，与暂停号的「让位防风控」
+// 冲突。判据抽成纯函数后可在 23:00–08:00 窗口外直接测（RunBlackcatNow 有窗口前置判断）。
+func TestBlackcatEligibility(t *testing.T) {
+	cases := []struct {
+		name string
+		st   pool.Status
+		want bool
+	}{
+		{"正常账号", pool.Status{}, true},
+		{"暂停选号跳过", pool.Status{Paused: true}, false},
+		{"禁用跳过", pool.Status{Disabled: true}, false},
+		{"两者兼有", pool.Status{Disabled: true, Paused: true}, false},
+	}
+	for _, c := range cases {
+		if got := blackcatEligible(c.st); got != c.want {
+			t.Errorf("%s: blackcatEligible=%v want %v", c.name, got, c.want)
+		}
 	}
 }

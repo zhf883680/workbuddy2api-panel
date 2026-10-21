@@ -276,37 +276,6 @@ func TestRateLimitedModelsMultiModel(t *testing.T) {
 	}
 }
 
-// 无重置时间的 6004 只写 AuditOnly 台账：账号页可见，但不得改变模型路由。
-func TestModelRateLimitAuditDoesNotAffectRouting(t *testing.T) {
-	p := New("")
-	p.Add(&auth.Auth{UID: "u1"})
-	p.CooldownSoftRate("u1", time.Minute, time.Time{}, "429 rate limit")
-	p.RecordModelRateLimitAudit("u1", "glm-5.3", "6004 model rate limit (reset unknown)")
-
-	p.mu.Lock()
-	e := p.byUID["u1"]
-	mc, ok := e.modelCooldowns["glm-5.3"]
-	if ok && mc.AuditOnly {
-		mc.Until = time.Now().Add(time.Hour)
-		e.modelCooldowns["glm-5.3"] = mc
-	}
-	p.mu.Unlock()
-	if !ok || !mc.AuditOnly {
-		t.Fatalf("audit entry missing: %+v ok=%v", mc, ok)
-	}
-	if e.modelCooled(time.Now(), "glm-5.3") {
-		t.Fatal("AuditOnly 台账不得参与 modelCooled")
-	}
-	if e.modelExempt() {
-		t.Fatal("仅 AuditOnly 台账不得让账号进入模型豁免形态")
-	}
-
-	st, _ := p.Status("u1")
-	if len(st.RateLimitedModels) != 1 || st.RateLimitedModels[0].Kind != "rate_limit" {
-		t.Fatalf("audit status = %+v, want one rate_limit row", st.RateLimitedModels)
-	}
-}
-
 // 11102 与 6004 共用台账但必须输出不同 kind。
 func TestRateLimitedModelKindModelUnavailable(t *testing.T) {
 	p := New("")
@@ -315,29 +284,6 @@ func TestRateLimitedModelKindModelUnavailable(t *testing.T) {
 	st, _ := p.Status("u1")
 	if len(st.RateLimitedModels) != 1 || st.RateLimitedModels[0].Kind != "model_unavailable" {
 		t.Fatalf("rows=%+v want model_unavailable", st.RateLimitedModels)
-	}
-}
-
-// AuditOnly 标记必须跨重启保留，否则无重置时间的 6004 展示项会失忆并参与路由。
-func TestModelRateLimitAuditPersists(t *testing.T) {
-	dir := t.TempDir()
-	fp := dir + "/state.json"
-	p := New(fp)
-	p.Add(&auth.Auth{UID: "u1"})
-	p.CooldownSoftRate("u1", time.Minute, time.Time{}, "429 rate limit")
-	p.RecordModelRateLimitAudit("u1", "glm-5.3", "6004 model rate limit (reset unknown)")
-	p.Flush()
-
-	p2 := New(fp)
-	p2.Add(&auth.Auth{UID: "u1"})
-	p2.mu.RLock()
-	mc, ok := p2.byUID["u1"].modelCooldowns["glm-5.3"]
-	p2.mu.RUnlock()
-	if !ok || !mc.AuditOnly {
-		t.Fatalf("audit entry not restored: %+v ok=%v", mc, ok)
-	}
-	if p2.byUID["u1"].modelExempt() {
-		t.Fatal("restored AuditOnly entry must not create model exemption")
 	}
 }
 
@@ -604,5 +550,70 @@ func TestModelCooldownsPersistCompatOldState(t *testing.T) {
 	}
 	if until.IsZero() {
 		t.Error("旧文件 until 应照常加载（账号级冷却兼容）")
+	}
+}
+
+// TestCooldownModelBusyShortWindow 14003「模型繁忙」的停车窗口：60s 起、封顶 3m，
+// 窗口内重复命中不延长，且不写账号级 until。
+//
+// 与 CooldownSoftForModel 的差别：14003 独立于 soft_rate 阶梯（600s 起、翻倍到
+// 2h），否则一次瞬时抖动就是十分钟不可用。
+func TestCooldownModelBusyShortWindow(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.CooldownModelBusy("u1", "glm-5.2", "14003 model busy")
+
+	p.mu.RLock()
+	e := p.byUID["u1"]
+	until := e.until
+	p.mu.RUnlock()
+	if !until.IsZero() {
+		t.Fatalf("模型繁忙不得写账号级 until: %v", until)
+	}
+	st, _ := p.Status("u1")
+	if st.Cooling {
+		t.Fatalf("账号不应进入 cooling: %+v", st)
+	}
+	if len(st.RateLimitedModels) != 1 || st.RateLimitedModels[0].Model != "glm-5.2" {
+		t.Fatalf("rate_limited_models=%+v want 一条 glm-5.2", st.RateLimitedModels)
+	}
+	first := st.RateLimitedModels[0].Until
+	if d := time.Until(first); d <= 0 || d > modelBusyBase+2*time.Second {
+		t.Errorf("首档 until=%v want ~%v", d, modelBusyBase)
+	}
+
+	// 窗口内重复命中：不延长。
+	p.CooldownModelBusy("u1", "glm-5.2", "14003 model busy")
+	st2, _ := p.Status("u1")
+	if !st2.RateLimitedModels[0].Until.Equal(first) {
+		t.Errorf("窗口内重复命中把 until 从 %v 推到 %v", first, st2.RateLimitedModels[0].Until)
+	}
+
+	// 窗口过期后连续命中：按次数翻倍，但封顶 modelBusyMax。
+	for i := 0; i < 6; i++ {
+		p.mu.Lock()
+		mc := e.modelCooldowns["glm-5.2"]
+		mc.Until = time.Now().Add(-time.Second)
+		e.modelCooldowns["glm-5.2"] = mc
+		p.mu.Unlock()
+		p.CooldownModelBusy("u1", "glm-5.2", "14003 model busy")
+	}
+	st3, _ := p.Status("u1")
+	if d := time.Until(st3.RateLimitedModels[0].Until); d > modelBusyMax+2*time.Second {
+		t.Errorf("翻倍后 until=%v 超过封顶 %v", d, modelBusyMax)
+	}
+}
+
+// TestCooldownModelBusyKeepsLaterCooldown 已有更晚的冷却（6004 墙钟 / 11102 负缓存）
+// 时，繁忙窗口不得把它缩短。
+func TestCooldownModelBusyKeepsLaterCooldown(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	later := time.Now().Add(50 * time.Minute)
+	p.CooldownSoftForModel("u1", time.Minute, later, "glm-5.2", "model rate limit")
+	p.CooldownModelBusy("u1", "glm-5.2", "14003 model busy")
+	st, _ := p.Status("u1")
+	if d := time.Until(st.RateLimitedModels[0].Until); d < 49*time.Minute {
+		t.Errorf("繁忙窗口把已有冷却从 50m 缩短到了 %v", d)
 	}
 }

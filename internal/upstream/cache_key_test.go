@@ -1,9 +1,15 @@
 package upstream
 
 import (
+	"bytes"
 	"encoding/json"
+	"io"
+	"net/http"
 	"strings"
 	"testing"
+
+	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/session"
 )
 
 // extractCacheKey 从改写后的 body 里取出 prompt_cache_key 字段值。
@@ -128,6 +134,89 @@ func TestInjectPromptCacheKey_EmptyConversation(t *testing.T) {
 	}
 }
 
+// TestChatMetaCacheKeySource 无 conversation_id 的客户端：缓存槽（prompt_cache_key）与
+// X-Conversation-ID 头**同源**，都跟网关派生的粘性会话键（CacheKeyID）——实测该头才是上游
+// 前缀缓存槽的实际来源，不发它时大前缀在 hy4/step 这类后端上恒 0% 命中（issue #169）。
+// 客户端自带 conversation_id 时两者仍以客户端声明为准（原值透传，不覆盖）。
+func TestChatMetaCacheKeySource(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		meta      ChatMeta
+		wantKey   string
+		wantConvH string
+		// wantConvAny：两源皆空时该头**不再留空**（上游渠道校验要求三件套齐全，缺任一头
+		// 即 400 code=11-128 "conversation id missing"）——现造 32 hex，值不可预知，只断言非空。
+		wantConvAny bool
+	}{
+		{"仅粘性键", ChatMeta{CacheKeyID: "sess-abc"}, buildCacheKey("u1", "sess-abc"), buildCacheKey("u1", "sess-abc"), false},
+		{"客户端会话优先", ChatMeta{ConversationID: "conv-1", CacheKeyID: "sess-abc"}, buildCacheKey("u1", "conv-1"), "conv-1", false},
+		{"两源皆空", ChatMeta{}, buildCacheKey("u1", ""), "", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var gotBody []byte
+			var gotConv string
+			c := testClient(func(r *http.Request) (*http.Response, error) {
+				gotBody, _ = io.ReadAll(r.Body)
+				gotConv = r.Header.Get("X-Conversation-ID")
+				return &http.Response{StatusCode: 200,
+					Header: http.Header{"Content-Type": []string{"text/event-stream"}},
+					Body:   io.NopCloser(strings.NewReader("data: [DONE]\n\n"))}, nil
+			})
+			a := &auth.Auth{AccessToken: "at", UID: "u1"}
+			rc, status, _, err := c.ChatStream(a, []byte(`{"model":"glm-5.2","messages":[]}`), "", tc.meta)
+			if err != nil || status != 200 {
+				t.Fatalf("status=%d err=%v", status, err)
+			}
+			rc.Close()
+			if got := extractCacheKey(t, gotBody); got != tc.wantKey {
+				t.Errorf("prompt_cache_key=%q want %q", got, tc.wantKey)
+			}
+			if tc.wantConvAny {
+				if gotConv == "" {
+					t.Error("X-Conversation-ID 不得留空：上游渠道校验要求三件套齐全")
+				}
+			} else if gotConv != tc.wantConvH {
+				t.Errorf("X-Conversation-ID=%q want %q（无客户端声明时用 uid 隔离的会话键）", gotConv, tc.wantConvH)
+			}
+		})
+	}
+}
+
+// TestCacheSlotFromStickySessionKey 无 conversation_id 的客户端：缓存槽按网关派生的
+// 粘性会话键分家 —— 同会话跨轮同槽（历史每轮追加也不换），异会话异槽。
+//
+// 为什么这条链必须钉住：粘性键 session.ExtractKey 是「会话级」（conv id / 客户端
+// prompt_cache_key / system+首条 user 的哈希），而轮级键 TurnKey 每轮都变。若哪天把
+// 轮级键接进缓存槽，每个对话轮都会换一个新 key → 前缀缓存永远冷启动（费用反向）。
+// 下方 TurnKey 断言即本用例的敏感度自证：两个轮级键确实不同。
+func TestCacheSlotFromStickySessionKey(t *testing.T) {
+	body := func(firstUser, second string) []byte {
+		msgs := `{"role":"system","content":"you are X"},{"role":"user","content":"` + firstUser + `"}`
+		if second != "" {
+			msgs += `,{"role":"assistant","content":"ok"},{"role":"user","content":"` + second + `"}`
+		}
+		return []byte(`{"model":"m","messages":[` + msgs + `]}`)
+	}
+	slotFor := func(b []byte) string {
+		t.Helper()
+		sk := session.ExtractKey(b)
+		if sk == "" {
+			t.Fatalf("ExtractKey 应派生出非空粘性键: %s", b)
+		}
+		return buildCacheKey("u1", cacheKeySource(ChatMeta{CacheKeyID: sk}))
+	}
+	turn1, turn2, other := body("hello", ""), body("hello", "next"), body("another topic", "")
+	if a, b := slotFor(turn1), slotFor(turn2); a != b {
+		t.Fatalf("同会话跨轮换了缓存槽：%q → %q", a, b)
+	}
+	if slotFor(turn1) == slotFor(other) {
+		t.Fatalf("异会话共用一个缓存槽：%q", slotFor(turn1))
+	}
+	if session.TurnKey(turn1) == session.TurnKey(turn2) {
+		t.Fatal("敏感度自证失败：轮级键本该逐轮不同")
+	}
+}
+
 // TestPrepareBodyOptNoCacheKeyInjection 覆盖任务用例 6：
 // PrepareBodyOpt（sanitize=false 的旧入口）行为不变——不注入 cache key。
 // 向后兼容：仅传 body 不给 cacheKey 上下文时，不得引入新字段。
@@ -140,5 +229,66 @@ func TestPrepareBodyOptNoCacheKeyInjection(t *testing.T) {
 	}
 	if _, present := obj["prompt_cache_key"]; present {
 		t.Fatalf("PrepareBodyOpt must NOT inject prompt_cache_key, but got: %v", obj["prompt_cache_key"])
+	}
+}
+
+func TestPromptCacheKeyPrecedence(t *testing.T) {
+	const uid = "user-abc-123"
+	uidKey := func(conv string) string { return buildCacheKey(uid, conv) }
+
+	cases := []struct {
+		name string
+		obj  map[string]any
+		conv string
+		want string // 空串表示不应注入（ok=false）
+	}{
+		{"existing client key", map[string]any{"prompt_cache_key": "client-key"}, "arg-conv", ""},
+		{"empty client key", map[string]any{"prompt_cache_key": ""}, "arg-conv", uidKey("arg-conv")},
+		{"non-string client key", map[string]any{"prompt_cache_key": 123}, "arg-conv", uidKey("arg-conv")},
+		{"snake conversation", map[string]any{"conversation_id": "conv-42"}, "arg-conv", uidKey("conv-42")},
+		{"camel conversation", map[string]any{"conversationId": "conv-43"}, "arg-conv", uidKey("conv-43")},
+		{"snake wins over camel", map[string]any{"conversation_id": "snake", "conversationId": "camel"}, "arg-conv", uidKey("snake")},
+		{"fallback to arg", map[string]any{}, "arg-conv", uidKey("arg-conv")},
+		{"all empty", map[string]any{}, "", uidKey("")},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, ok := promptCacheKeyFor(c.obj, uid, c.conv)
+			if c.want == "" {
+				if ok {
+					t.Fatalf("ok=true key=%q, want no injection", got)
+				}
+				return
+			}
+			if !ok || got != c.want {
+				t.Fatalf("got=(%q,%v), want (%q,true)", got, ok, c.want)
+			}
+		})
+	}
+}
+
+// TestPrepareBodyCacheKeyEquivalence 钉住「同一次解析注入」与旧「两遍
+// PrepareBodyOpt + InjectPromptCacheKey」的最终字节完全一致。
+func TestPrepareBodyCacheKeyEquivalence(t *testing.T) {
+	const uid = "user-abc-123"
+	const conv = "conv-arg"
+	bodies := []string{
+		`{"model":"glm-5.2","messages":[]}`,
+		`{"model":"glm-5.2","messages":[],"prompt_cache_key":"client-key"}`,
+		`{"model":"glm-5.2","messages":[],"conversation_id":"conv-42"}`,
+		`{"model":"glm-5.2","messages":[],"conversationId":"conv-43"}`,
+		`{"model":"glm-5.2","messages":[],"conversation_id":"snake","conversationId":"camel"}`,
+		`{"model":"glm-5.2","messages":[],"prompt_cache_key":123}`,
+		`not json`,
+		``,
+	}
+	for _, in := range bodies {
+		t.Run(in, func(t *testing.T) {
+			oldBody := InjectPromptCacheKey(PrepareBodyOpt([]byte(in), false), uid, conv)
+			newBody, _, _ := prepareBodyOpt([]byte(in), false, nil, nil, nil, uid, conv, true)
+			if !bytes.Equal(oldBody, newBody) {
+				t.Fatalf("body mismatch\nold=%s\nnew=%s", oldBody, newBody)
+			}
+		})
 	}
 }

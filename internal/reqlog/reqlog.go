@@ -78,7 +78,7 @@ type Event struct {
 	TotalTokens      int64     `json:"total_tokens,omitempty"`
 	Credit           float64   `json:"credit,omitempty"`
 	HasCredit        bool      `json:"credit_known"`
-	// CacheHitTokens / CacheMissTokens 上游前缀缓存命中/未命中 token（issue #92）。
+	// CacheHitTokens / CacheMissTokens 上游前缀缓存命中/未命中 token（issue #92 同步）。
 	// 上游未回该维度时两者皆零值省略；hit=0 + miss>0 即整段未命中。
 	CacheHitTokens  int64  `json:"cache_hit_tokens,omitempty"`
 	CacheMissTokens int64  `json:"cache_miss_tokens,omitempty"`
@@ -531,26 +531,39 @@ func (w *archiveWriter) read(limit int, filter Filter) ([]Event, error) {
 	if err != nil {
 		return nil, err
 	}
-	// 文件读取顺序无关紧要：结果一律按事件时间排序。不能依赖归档文件的 mtime 还原时间
-	// 顺序——同一秒内连续轮转写出的多个文件 mtime 经常完全相同（Linux 文件时间戳粒度粗），
-	// os.ReadDir 的字典序又会把装着最早事件的基准文件 requests-<day>.jsonl 排在
-	// requests-<day>.N.jsonl 之后；目录被整体拷贝 / 恢复备份后 mtime 更不可信。
-	var out []Event
+	type fileItem struct {
+		path  string
+		mtime time.Time
+	}
+	files := make([]fileItem, 0, len(entries))
 	for _, entry := range entries {
 		name := entry.Name()
 		if entry.IsDir() || !strings.HasPrefix(name, "requests-") || !strings.HasSuffix(name, ".jsonl") {
 			continue
 		}
-		rows, err := readFile(filepath.Join(w.cfg.Dir, name), filter)
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+		files = append(files, fileItem{path: filepath.Join(w.cfg.Dir, name), mtime: info.ModTime()})
+	}
+	sort.Slice(files, func(i, j int) bool { return files[i].mtime.Before(files[j].mtime) })
+	var out []Event
+	for _, file := range files {
+		rows, err := readFile(file.path, filter)
 		if err != nil {
 			return out, err
 		}
 		out = append(out, rows...)
 	}
-	// 契约：按事件时间倒序返回最近 limit 条（同一时刻用 Stable 保留落盘先后）。
-	sort.SliceStable(out, func(i, j int) bool { return out[i].Time.After(out[j].Time) })
+	// 按事件时间排序，而不是依赖文件 mtime 顺序：分片文件在同一毫秒内落盘时
+	// mtime 可能完全相同（粗粒度时间戳的文件系统），文件顺序随机 → 「最近 N 条」取错样本。
+	sort.Slice(out, func(i, j int) bool { return out[i].Time.Before(out[j].Time) })
 	if len(out) > limit {
-		out = out[:limit]
+		out = out[len(out)-limit:]
+	}
+	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
+		out[i], out[j] = out[j], out[i]
 	}
 	return out, nil
 }

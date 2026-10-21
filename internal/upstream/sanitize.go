@@ -201,9 +201,8 @@ func sanitizeMessages(messages []any) bool {
 			}
 		}
 		// reasoning：另一形态的思维链字段。thinking.go 的回填会把客户端送来的
-		// reasoning_content 镜像进 reasoning（反之亦然），而此前只洗 content /
-		// reasoning_content / tool_calls —— 镜像进 reasoning 的指纹原样出站，
-		// 裸 "11128" 这种反探测串同样致命。
+		// reasoning_content 镜像进 reasoning（backfillReasoningContent 就排在
+		// sanitizeMessages 之前），漏洗这一份等于指纹原样出站。
 		if r, ok := m["reasoning"].(string); ok {
 			if s := sanitizeText(r); s != r {
 				m["reasoning"] = s

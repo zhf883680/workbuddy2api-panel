@@ -41,6 +41,13 @@ func TestClassify(t *testing.T) {
 		{400, `Illegal API invocation from an unapproved channel`, ErrContentBlocked},
 		{400, `{"code":11128,"msg":"blocked by security policy"}`, ErrContentBlocked},
 		{400, `unapproved channel`, ErrContentBlocked},
+		// 11140 的第二种形态：内容安全审核（官方会打断会话的那条文案）。
+		// 未收录时落 ErrClient：只换号不罚号、也不走降级重试，客户端拿到必然失败的答复。
+		{400, `{"code":11140,"msg":"Content failed safety review. Please revise it"}`, ErrContentBlocked},
+		// 14003 RateLimitError：模型忙（官方文案「当前模型请求繁忙，请切换模型」），
+		// 不是额度耗尽；200 信封形态也必须归软限流（否则账号不会被停车）。
+		{429, `{"code":14003,"msg":"too many requests","displayMsg":{"zh":"请求过于频繁，请稍后重试。"}}`, ErrSoftRate},
+		{200, `{"code":14003,"msg":"too many requests","displayMsg":{"zh":"请求过于频繁，请稍后重试。"}}`, ErrSoftRate},
 		// 通用 4xx（非审核文案）：仍判 ErrClient，只换号不罚。
 		{400, `bad request`, ErrClient},
 		// ErrBadParams：请求体解析失败（HTTP 400 + Unmarshal chat params failed / code 11101）。
@@ -56,8 +63,17 @@ func TestClassify(t *testing.T) {
 		// 11135 业务码须容忍 JSON 空白（5d5223d：字面量 marker 只覆盖紧凑形态）。
 		{400, `{"code": 11135, "msg":"image data invalid"}`, ErrImageInvalid},
 		{400, `{"error":{"code": "11135", "message":"image invalid"}}`, ErrImageInvalid},
-		// 防过宽：11133（模型不支持图片）不进 image_invalid。
-		{400, `{"code": 11133, "msg":"model does not support image"}`, ErrClient},
+		// 防过宽：11133（模型不支持图片）不进 image_invalid——它自成一类确定性请求级
+		// 错误（ErrModelParamInvalid），与 11135/11115 同待遇：不轮转、不罚号、末端 400 透传。
+		{400, `{"code": 11133, "msg":"model does not support image"}`, ErrModelParamInvalid},
+		// 11133 家族实测形态（缺/空 messages）：extError.param=messages + StatusCode 400。
+		{400, `{"code":11133,"msg":"the request parameters were rejected by the model provider","extError":{"code":"400002","param":"messages","type":"invalid_request_error","StatusCode":400}}`, ErrModelParamInvalid},
+		{400, `{"code":"11133","msg":"model_param_invalid"}`, ErrModelParamInvalid},
+		{400, `invalid request parameters`, ErrModelParamInvalid},
+		{400, `the request parameters do not meet the current model requirements`, ErrModelParamInvalid},
+		// 状态码先于业务码：429/5xx 上的 11133 不得抢走限流/服务端语义。
+		{429, `{"code":11133,"msg":"the request parameters were rejected"}`, ErrSoftRate},
+		{503, `{"code":11133,"msg":"the request parameters were rejected"}`, ErrServer},
 		{200, `quota exceeded`, ErrHardCredit},
 		// session 死亡优先于限流文案（401+12153 需人工重登，短冷却无意义）。
 		{401, `{"code":12153,"msg":"Offline user session not found, rate limit"}`, ErrSessionDead},
@@ -71,6 +87,11 @@ func TestClassify(t *testing.T) {
 		{404, `{"code":11102,"msg":"model [deepseek-v3-2-volc] service info not found"}`, ErrModelBlocked},
 		{400, `{"error":{"code":"11102","message":"model service info not found"}}`, ErrModelBlocked},
 		{400, `{"msg":"service info not found"}`, ErrModelBlocked},
+		// 11158 是账号类型级模型权限拒绝：同一模型换有权限的账号仍可能成功，
+		// 按 (账号, 模型) 避让；不能落入 ErrClient 轮转后误报 503。
+		{400, `{"code":11158,"msg":"model [gpt-5.6-sol] is not allowed for user type [personal_free_user]"}`, ErrModelBlocked},
+		{400, `{"error":{"code":"11158","message":"model is not allowed for user type"}}`, ErrModelBlocked},
+		{429, `{"code":11158,"msg":"model is not allowed for user type"}`, ErrSoftRate},
 		// 11102 撞在 requestId 上不算（不得误避让可用模型）。
 		{404, `{"requestId":"11102","msg":"ok"}`, ErrNotFound},
 		// 429 + 11102 → 限流语义（ErrSoftRate），不是模型不存在。
@@ -109,6 +130,31 @@ func TestClassify(t *testing.T) {
 		// 非 403 的无信封错误体不进 WAF 分类（WAF 判定绑定 403 形态）。
 		{400, `bad request`, ErrClient},
 		{429, ``, ErrSoftRate},
+		// 网关 401（APISIX `invalid_token` 页，无业务信封）→ session 死亡，需重登。
+		// 夹具是 2026-10-17 实测原文（CN 站 /v2/chat/completions，token 被上游作废）。
+		// 旧行为落 ErrClient（只换号不罚）⇒ 死号永久留在池里，每请求刷一排 401。
+		{401, "<html><head><title>401 Authorization Required</title></head><body><center><h1>401 Authorization Required</h1></center><hr><center>openresty</center><p><em>Powered by APISIX.</em></p></body></html>", ErrSessionDead},
+		{401, ``, ErrSessionDead},
+		{401, `Unauthorized`, ErrSessionDead},
+		// 业务层 401 带信封的维持既有语义：12153 仍是 session 死亡；
+		// 其他业务码不劫持（不许把网关 401 的判定扩张到带信封的响应）。
+		{401, `{"code":12153,"msg":"12153:refresh token is invalid"}`, ErrSessionDead},
+		{401, `{"code":1,"msg":"unknown business error"}`, ErrClient},
+		// 6021「queue.full.title」渠道级准入队列满：任意状态码都判 upstream_busy
+		//（防上游换状态码），结构化 code 主判、requestId 含 "6021" 不误伤。
+		{429, `{"code":6021,"msg":"queue.full.title","requestId":"341738971737c911985e5b9e67a4eceb"}`, ErrUpstreamBusy},
+		{500, `{"code":6021,"msg":"queue.full.title"}`, ErrUpstreamBusy},
+		// 防过宽：普通 429（无 queue 语义）仍是账号级软限流。
+		{429, `{"code":1,"msg":"too many requests"}`, ErrSoftRate},
+		{429, `{"requestId":"6021","msg":"rate limit"}`, ErrSoftRate},
+		// 11148 工具配对断裂：请求内容级（上游「直接重试无效，请新建任务」），
+		// 换号/重试必然同样失败——不得落 ErrClient 白轮转全池。
+		{400, `{"code":11148,"msg":"tool calls and tool results do not match"}`, ErrToolMismatch},
+		// 5xx 外壳同样认（上游对同因有时换状态码）。
+		{500, `{"code": 11148,"msg":"tool calls and tool results do not match"}`, ErrToolMismatch},
+		// 防过宽：相邻错误码不误伤（11140 账号级风控、11115 超长各有归属）。
+		{400, `{"code":11140,"msg":"request illegal"}`, ErrAccountFault},
+		{400, `{"code":11115,"msg":"prompt is too long"}`, ErrPromptTooLong},
 	}
 	for _, c := range cases {
 		if got := Classify(c.status, c.body); got != c.want {
@@ -605,8 +651,8 @@ func TestFetchModelsOverlaysV3ConfigCapabilities(t *testing.T) {
 			],"agents":[{"name":"cli","models":["deepseek-v4.1-flash"]}]}}`), nil
 		case strings.HasSuffix(r.URL.Path, "/v3/config"):
 			sawIDE = true
-			if r.Header.Get("User-Agent") != codeBuddyIDEUA {
-				t.Errorf("v3/config UA=%q want %s", r.Header.Get("User-Agent"), codeBuddyIDEUA)
+			if r.Header.Get("User-Agent") != v3ProbeUACNForTest {
+				t.Errorf("v3/config UA=%q want %s", r.Header.Get("User-Agent"), v3ProbeUACNForTest)
 			}
 			if r.Header.Get("X-Product") != "SaaS" {
 				t.Errorf("X-Product=%q want SaaS", r.Header.Get("X-Product"))
@@ -648,5 +694,50 @@ func TestFetchModelsOverlaysV3ConfigCapabilities(t *testing.T) {
 	}
 	if got := strings.Join(mi.Efforts, ","); got != "low,high,max" {
 		t.Errorf("Efforts=%v want low,high,max", mi.Efforts)
+	}
+}
+
+// TestIsModelRateLimitCodes 模型级限流的 code 集合：6004（已有）与 14003（模型忙）。
+// 14003 若漏收，槽位会落到账号级冷却——一个模型抖动就能冷掉整池（同类实现的线上事故形态）。
+func TestIsModelRateLimitCodes(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want bool
+	}{
+		{"6004 完整形态", `{"code":6004,"msg":"将在 2026-10-05 20:00:00 重置"}`, true},
+		{"6004 带空格", `{"code": 6004}`, true},
+		{"14003 模型忙", `{"code":14003,"msg":"too many requests"}`, true},
+		{"14003 字符串码", `{"code":"14003"}`, true},
+		{"14018 额度耗尽不算模型级", `{"code":14018,"msg":"credits exhausted"}`, false},
+		{"11140 账号风控不算模型级", `{"code":11140,"msg":"request illegal"}`, false},
+		{"无 code", `{"msg":"too many requests"}`, false},
+	}
+	for _, c := range cases {
+		if got := IsModelRateLimit(c.body); got != c.want {
+			t.Errorf("%s: IsModelRateLimit=%v want %v", c.name, got, c.want)
+		}
+	}
+}
+
+// TestIsModelBusy 区分「模型繁忙」14003 与「额度窗口用满」6004：前者没有恢复
+// 时刻，只能短窗口退避；后者带「将在 … 重置」的权威墙钟。两者混用会让一次
+// 瞬时抖动被停成十分钟（线上国际版就是这样整池冷 10 分钟）。
+func TestIsModelBusy(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want bool
+	}{
+		{"14003 完整形态", `{"code":14003,"msg":"too many requests","displayMsg":{"zh":"模型繁忙，请换模型或稍后重试"}}`, true},
+		{"14003 带空格", `{"code": 14003}`, true},
+		{"14003 字符串码", `{"code":"14003"}`, true},
+		{"6004 不是繁忙", `{"code":6004,"msg":"将在 2026-10-20 16:37:47 UTC+8 重置"}`, false},
+		{"requestId 里出现 14003 不误判", `{"code":1,"requestId":"14003abc"}`, false},
+	}
+	for _, c := range cases {
+		if got := IsModelBusy(c.body); got != c.want {
+			t.Errorf("%s: IsModelBusy=%v want %v", c.name, got, c.want)
+		}
 	}
 }

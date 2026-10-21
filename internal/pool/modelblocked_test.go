@@ -1,6 +1,7 @@
 package pool
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -8,7 +9,7 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// ModelBlocked：区分「号都在但都对这个模型关闭」与「池子真没号」（issue #102a）
+// ModelBlocked：区分「号都在但都对这个模型关闭」与「池子真没号」（吸收上游 44d6e04）
 // ---------------------------------------------------------------------------
 
 // TestModelBlockedAllAccountsCooled 全部账号都对该模型冷却 → Blocked，
@@ -65,6 +66,36 @@ func TestModelBlockedOneAccountStillServes(t *testing.T) {
 	p.mu.RUnlock()
 	if cooled {
 		t.Fatalf("测试构造有误：u2 不该对该模型冷却")
+	}
+}
+
+// TestModelBlockedForRealmIgnoresOtherRealm 模型请求分池后，另一域的账号不能
+// 掩盖本域全锁：global 两个号都被 11158 锁住时，即使 CN 号未锁也应返回 Blocked。
+func TestModelBlockedForRealmIgnoresOtherRealm(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "cn1", Domain: "www.codebuddy.cn"})
+	p.Add(&auth.Auth{UID: "g1", Domain: "www.workbuddy.ai"})
+	p.Add(&auth.Auth{UID: "g2", Domain: "www.workbuddy.ai"})
+	p.BlockModelBackoff("g1", "gpt-5.6-sol", "11158 model not allowed for account type")
+	p.BlockModelBackoff("g2", "gpt-5.6-sol", "11158 model not allowed for account type")
+
+	if st := p.ModelBlockedForRealm("gpt-5.6-sol", "global"); !st.Blocked || st.Count != 2 {
+		t.Fatalf("global 域应判定为全锁，得到 %+v", st)
+	} else if !strings.HasPrefix(st.Reason, "11158") {
+		t.Fatalf("模型锁原因应保留 11158，得到 %q", st.Reason)
+	}
+	if st := p.ModelBlockedForRealm("gpt-5.6-sol", "cn"); st.Blocked {
+		t.Fatalf("cn 域仍有可用账号，不应判定为全锁：%+v", st)
+	}
+	// 旧入口保持跨域口径，便于非分池调用方向后兼容。
+	if st := p.ModelBlocked("gpt-5.6-sol"); st.Blocked {
+		t.Fatalf("跨域仍有 cn1 可用，旧入口不应报全锁：%+v", st)
+	}
+	// 11158 与 11102 一样是确定性负缓存，权限恢复后成功请求必须能清除。
+	p.BlockModelClear("g1", "gpt-5.6-sol")
+	p.BlockModelClear("g2", "gpt-5.6-sol")
+	if st := p.ModelBlockedForRealm("gpt-5.6-sol", "global"); st.Blocked {
+		t.Fatalf("清除 11158 后不应再阻塞：%+v", st)
 	}
 }
 
@@ -157,25 +188,38 @@ func TestModelBlockedThenClear(t *testing.T) {
 	}
 }
 
-// TestModelBlockedPausedDoesNotMaskBlock 暂停号不构成「能服务」的证明：
-// 除暂停号外全部模型冷却时仍应判定阻塞（合并 #113 时补的口径——
-// 否则一个暂停的健康号会掩盖「其余号全被模型级冷却挡住」）。
-func TestModelBlockedPausedDoesNotMaskBlock(t *testing.T) {
+// TestModelForbiddenReasonClearedAndTagged 11158 条目必须与 11102 同等对待：
+//   - 写入后可被 BlockModelClear 清除（否则该模型重新获得权限后永不恢复，直到 6h~24h
+//     退避到期；上游换了权限档位这种情况很常见）；
+//   - 台账 kind 记 model_unavailable（不是 rate_limit：这不是限流，不会自己退）；
+//   - 6004 条目不受影响（成功不该抹掉上游给的重置墙钟）。
+func TestModelForbiddenReasonClearedAndTagged(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
-	p.Add(&auth.Auth{UID: "u2"})
-	p.mu.Lock()
-	p.byUID["u1"].modelCooldowns = map[string]modelCooldown{
-		"glm-5.3": {Until: time.Now().Add(time.Hour), Reason: "11102 ..."},
-	}
-	p.byUID["u2"].paused = true // 唯一「健康」的号在暂停让位
-	p.mu.Unlock()
 
-	st := p.ModelBlocked("glm-5.3")
-	if !st.Blocked {
-		t.Fatalf("暂停号不得掩盖模型级阻塞：%+v", st)
+	p.BlockModelBackoff("u1", "claude-opus-4-1", "11158 model not allowed for account type")
+	p.BlockModelBackoff("u1", "glm-5.3", "6004 model rate limit")
+
+	st, _ := p.Status("u1")
+	kinds := map[string]string{}
+	for _, row := range st.RateLimitedModels {
+		kinds[row.Model] = row.Kind
 	}
-	if st.Count != 1 {
-		t.Errorf("Count=%d want 1（暂停号不计入）", st.Count)
+	if kinds["claude-opus-4-1"] != "model_unavailable" {
+		t.Fatalf("11158 条目 kind=%q want model_unavailable（rows=%+v）", kinds["claude-opus-4-1"], st.RateLimitedModels)
+	}
+	if kinds["glm-5.3"] != "rate_limit" {
+		t.Fatalf("6004 条目 kind=%q want rate_limit", kinds["glm-5.3"])
+	}
+
+	p.BlockModelClear("u1", "claude-opus-4-1")
+	st, _ = p.Status("u1")
+	for _, row := range st.RateLimitedModels {
+		if row.Model == "claude-opus-4-1" {
+			t.Fatalf("11158 条目应被 BlockModelClear 清除：%+v", row)
+		}
+		if row.Model != "glm-5.3" {
+			t.Fatalf("只应保留 6004 条目，实际还有 %+v", row)
+		}
 	}
 }

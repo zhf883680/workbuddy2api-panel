@@ -3,6 +3,7 @@ package pool
 
 import (
 	"log"
+	"math"
 	"math/rand/v2"
 	"sort"
 	"strconv"
@@ -58,10 +59,9 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string, allowed map[s
 	defer p.mu.Unlock()
 	now := time.Now()
 	realmOK := func(e *entry) bool { return realm == "" || e.a.Realm() == realm }
-	healthyOf := func(e *entry) bool { return realmOK(e) && e.healthy(now) }
-	if reqModel != "" {
-		healthyOf = func(e *entry) bool { return realmOK(e) && e.healthyForModel(now, reqModel) }
-	}
+	// 不健康 / 在途占满 / 保留积分停牌：都不接单（判据统一在 Pool.selectable；
+	// reqModel 非空时用 healthyForModel 口径）。
+	selectableOf := func(e *entry) bool { return realmOK(e) && p.selectable(e, now, reqModel) }
 	// floorBlocked 积分保底拦截判定（实现在 floorBlockedForRealmModel，与粘性路径共用）：
 	// 触底 + 收费（本地实测台账 或 上游目录倍率）即拦；免费/未知倍率不受限。
 	floorBlocked := func(e *entry) bool { return p.floorBlockedForRealmModel(e, reqModel, realm, now) }
@@ -77,14 +77,11 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string, allowed map[s
 		// status 只读遍历天然跳过过期项，但内存条目必须在此真正删除）。
 		e.pruneExpiredModelCooldowns(now)
 		e.pruneExpiredModelCosts(now)
-		if !healthyOf(e) {
+		if !selectableOf(e) {
 			continue
 		}
 		if floorBlocked(e) {
 			continue // 积分保底：触底号不接实测收费模型（tier 0/1 不受限）
-		}
-		if p.inFlightFull(e) {
-			continue // 在途占满：跳过（max=0 不限时不触发）
 		}
 		cands = append(cands, e)
 	}
@@ -93,16 +90,17 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string, allowed map[s
 		// （熔断/冷却共用 expiry 口径，取较早截止者）。禁用的账号永不参与兜底。
 		return p.pickEarliestExpiryLocked(tried, now, realm, reqModel, allowed)
 	}
+	// 账号优先级（issue #62）：配了优先级的号构成「先烧层」，层内有号可用时其余号一律
+	// 不接单——「优先消耗某个账号的余额」是一条硬语义，加权排序做不到（排序只改抽签
+	// 次序，高优先级号仍会被抽到）。放在成本分层之前：人的显式配置压过自动启发式。
+	// 零配置时 prioritizeLocked 原样返回，本行无副作用。冷却/停牌/在途满的号已在上面的
+	// 候选循环里被逐出，所以层内号烧空/冻结后本层自动让位给下一层。
+	cands = p.prioritizeLocked(cands)
 	// top5 短名单按权重降序截断（而非 credits 单纯降序）：否则闲置补偿根本进不了
 	// 短名单决策，低 credits 但久置的账号会永远排不进 top5。
 	// maxCredits 统一用**全集口径**（tier 过滤前的全部 healthy 候选）：截断排序与
 	// 抽签权重共享同一基准，两个阶段权重可比。
-	var maxCredits int64
-	for _, e := range cands {
-		if e.credits > maxCredits {
-			maxCredits = e.credits
-		}
-	}
+	maxCredits := secondCredits(cands)
 	// 成本分层（reqModel 非空时）：按该模型的实测扣费把候选分层，只保留最优层。
 	//   0 = 已实测免费（限免期/夜间免费的号，最强偏好）
 	//   1 = 无观测（含观测过期）
@@ -211,29 +209,40 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string, allowed map[s
 		cands = cands[:5]
 	}
 	var e *entry
+	// 账号占比（issue #62）：本层内配了占比的号独占抽签，按 share 归一化分流量
+	// （70/30 与 7/3 同义）。两条次序要求：
+	//   1. 先于「快过期虚拟实例加权」——后者是自动启发式，显式占比压在它之前；
+	//   2. 不走 top5 截断——截断按权重取前 5，低占比号会永远进不了短名单，占比无从生效。
+	// 配了占比的号全不可用（冷却/在途满/停牌已被逐出）时本分支自动让位，回到既有
+	// 加权路由：占比是分配偏好，不是排他锁，不会把请求饿死。
+	if sp := p.sharePoolLocked(candsAll); len(sp) > 0 {
+		e = p.pickByShare(sp)
+	}
 	// 防并发撞号：在持锁内基于「上次选中时刻」过滤，但同一批并发 goroutine 会串行进入
 	// 本函数（写锁），每个进入者都把 lastUsed 置为 now —— 于是同一瞬间的第 2..N 个
 	// 进入者看到前一个账号 lastUsed==now（距今 0 < minPickGap），被自然挤向其他账号。
 	// 关键：lastUsed 在锁内赋值，使时间窗口判定在并发下可重入。
-	eligible := make([]*entry, 0, len(cands))
-	for _, c := range cands {
-		if now.Sub(c.lastUsed) >= minPickGap {
-			eligible = append(eligible, c)
-		}
-	}
-	if len(eligible) == 0 {
-		// top5 全部刚被用过：LRU 兜底，在**全候选 candsAll**（非仅 top5）里选最旧者。
-		// 用 usedSeq 单调序号而非 lastUsed 墙钟比较：Windows 等平台 time.Now() 精度
-		// ~0.5ms，快速连续选号时所有 lastUsed 完全相等，Before 全 false 会恒选
-		// candsAll[0] 导致集中。usedSeq 严格全序，与时间精度无关。
-		e = candsAll[0]
-		for _, c := range candsAll[1:] {
-			if c.usedSeq < e.usedSeq {
-				e = c
+	if e == nil {
+		eligible := make([]*entry, 0, len(cands))
+		for _, c := range cands {
+			if now.Sub(c.lastUsed) >= minPickGap {
+				eligible = append(eligible, c)
 			}
 		}
-	} else {
-		e = p.pickWeighted(eligible) // eligible 保序 = top5 降序子集
+		if len(eligible) == 0 {
+			// top5 全部刚被用过：LRU 兜底，在**全候选 candsAll**（非仅 top5）里选最旧者。
+			// 用 usedSeq 单调序号而非 lastUsed 墙钟比较：Windows 等平台 time.Now() 精度
+			// ~0.5ms，快速连续选号时所有 lastUsed 完全相等，Before 全 false 会恒选
+			// candsAll[0] 导致集中。usedSeq 严格全序，与时间精度无关。
+			e = candsAll[0]
+			for _, c := range candsAll[1:] {
+				if c.usedSeq < e.usedSeq {
+					e = c
+				}
+			}
+		} else {
+			e = p.pickWeighted(eligible) // eligible 保序 = top5 降序子集
+		}
 	}
 	if explored {
 		// 探索事件日志（可观测性）：选中号此时才确定，故在选中点打出。
@@ -278,14 +287,18 @@ func (p *Pool) floorBlockedForModel(e *entry, model string, now time.Time) bool 
 // floorBlockedForRealmModel 同上，但带 realm 上下文（倍率按 (realm, 模型) 分桶，
 // 同名模型在 CN / global 两域倍率可不同）。realm 为空时按倍率表的空域键查。
 func (p *Pool) floorBlockedForRealmModel(e *entry, model, realm string, now time.Time) bool {
-	if p.creditFloor <= 0 || model == "" || e.credits >= p.creditFloor {
+	if p.creditFloor <= 0 || model == "" || e.exactCredits() >= float64(p.creditFloor) {
 		return false
 	}
 	// 1) 本地实测台账：最权威（真实扣费证据）。
 	if mc, ok := e.modelCostOf(model, now); ok {
 		return mc.CostPer1k > 0
 	}
-	// 2) 上游目录倍率兜底：无实测观测时用牌价判收费，堵住「无观测 = 放行」漏洞。
+	// 2) 上游目录倍率兜底：无实测观测时用牌价判收费，堵住「无观测 = 全放行」漏洞
+	//    （kimi-k3-1 实案：x1.62 的模型两笔打穿 100 分的号）。
+	//    但全额拦会把便宜的新模型也锁死（issue #30/PR #2：x0.11 的新模型在触底号上
+	//    永远跑不出第一笔账本 → 账本永远学不回来）。故按倍率分档：≤
+	//    creditFloorMaxRate 放行（允许入账），> 该值仍拦；上限 0 = 严格模式（旧行为）。
 	if p.modelRateOf == nil {
 		return false
 	}
@@ -297,7 +310,7 @@ func (p *Pool) floorBlockedForRealmModel(e *entry, model, realm string, now time
 	if err != nil {
 		return false // 倍率非数值（异常形态）：不据此惩罚账号
 	}
-	return v > 0
+	return v > p.creditFloorMaxRate
 }
 
 // pickEarliestExpiryLocked 全冷却兜底：在非禁用的软冷却/熔断账号中选截止最早的一个。
@@ -329,6 +342,16 @@ func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, re
 		}
 		if p.floorBlockedForRealmModel(e, model, realm, now) {
 			continue // 积分保底：触底号不接收费模型（兜底路径同判据）
+		}
+		// 保留积分停牌（reserve）：与正常路径 selectable 的第一判据同源。兜底是
+		// **最后一道**选号路径——上面那段注释怎么论证 floor 必须在这里生效，reserve
+		// 就是同一回事：健康候选被 reserve 全拦净后 cands 为空，兜底若不看 reserve，
+		// 就会把刚停牌的号捞回来继续接付费模型，reserve 形同虚设（且 ServableForRealm
+		// 是按 reserve 判「不可服务」的，会出现 healthz 报不可用、真请求却还能选到的
+		// 口径裂缝）。免费档豁免复用 reserveBlocked 的 modelFree 口径（modelFreeOf 查
+		// 上游目录倍率 == 0），保证余额见底的号最后一点额度仍能服务于免费模型。
+		if p.reserveBlocked(e, p.modelFreeOf(e, model)) {
+			continue
 		}
 		if p.inFlightFull(e) {
 			continue
@@ -381,12 +404,7 @@ var minPickGap = 100 * time.Millisecond
 // 随机源优先用 p.randInt64N（仅供测试注入确定性），nil 时回退 math/rand/v2 全局源。
 func (p *Pool) pickWeighted(cands []*entry) *entry {
 	now := time.Now()
-	var maxCredits int64
-	for _, e := range cands {
-		if e.credits > maxCredits {
-			maxCredits = e.credits
-		}
-	}
+	maxCredits := secondCredits(cands)
 	const scale = 1_000_000 // 定点放大：int64 累加权重大整数抽签
 	weights := make([]int64, len(cands))
 	var total int64
@@ -415,10 +433,46 @@ func (p *Pool) pickWeighted(cands []*entry) *entry {
 
 // weightOf 计算单个账号的普通加权分值。
 func (p *Pool) weightOf(e *entry, maxCredits int64, now time.Time) float64 {
+	return p.weightOfScaled(e, maxCredits, now, 1)
+}
+
+// sentinelCredits 企业版「不限量」在池内的哨兵剩余量，与
+// upstream.enterpriseUnlimitedRemain 同值（pool 不 import upstream，故重复一次常量）。
+const sentinelCredits int64 = 1 << 40
+
+// secondCredits 返回权重分母：正常情况下就是最大余额；最大余额是哨兵时取第二大。
+//
+// 哨兵当分母会把其余账号的 credits 项压到 0 → 不限量号独吞流量（issue #222）。
+// shortcut: 只按哨兵值本身判，不按倍数——100000 对 10 也是 1e4 倍，但那是真实余额差。
+func secondCredits(cands []*entry) int64 {
+	var first, second int64
+	for _, e := range cands {
+		switch {
+		case e.credits > first:
+			second, first = first, e.credits
+		case e.credits > second:
+			second = e.credits
+		}
+	}
+	if first >= sentinelCredits {
+		return second
+	}
+	return first
+}
+
+// weightOfScaled 同 weightOf，但 credits 项乘 creditScale（1 = 原口径）。
+// 窗口内账号传 expiringCreditScale，把余额从主轴降为次轴（见该常量）。
+func (p *Pool) weightOfScaled(e *entry, maxCredits int64, now time.Time, creditScale float64) float64 {
 	w := 1.0
 	// 1. credits 比例 ×10（会计入 mid-credit 锚点，避免全员 0 时 credits 项为 0）。
+	// 超分母的余额钳到满权重。分母已排除哨兵，所以这里只可能命中企业「不限量」
+	// （1<<40）；正常余额差（哪怕 1e4 倍）不会被钳，「余额最多优先」照旧（issue #222）。
 	if maxCredits > 0 {
-		w += float64(e.credits) / float64(maxCredits) * 10
+		cred := e.credits
+		if cred > maxCredits {
+			cred = maxCredits
+		}
+		w += float64(cred) / float64(maxCredits) * 10 * creditScale
 	}
 	// 2. 闲置补偿。
 	if e.lastUsed.IsZero() {
@@ -448,14 +502,96 @@ func expiringNow(e *entry, now time.Time) bool {
 		e.creditsEarliestExpiry.After(now)
 }
 
-// routingWeightOf 在普通账号权重上叠加快过期虚拟实例数量。prefer_expiring=false
-// 或账号无有效快过期批次时，实例数恒为 1，结果与旧 weightOf 完全一致。
-func (p *Pool) routingWeightOf(e *entry, maxCredits int64, now time.Time) float64 {
-	w := p.weightOf(e, maxCredits, now)
-	if p.preferExpiring && expiringNow(e, now) {
-		return w * expiringVirtualSlots
+// expiringUrgency 快过期账号的紧迫度倍率（1 = 不加权）。
+//
+// 与固定倍率（expiringVirtualSlots）的差别：刚进窗口只有 expiringUrgencyMin，
+// 越逼近到期越接近 expiringUrgencyMax —— 「今天到期」因此真正优先于「下周到期」，而
+// 不是两者等价（灵感：上游 issue #140 第 1、2 点）。
+//
+// 形状用 sqrt(T/W) 而非 T/W（线性）：窗口默认 168h，线性下「还剩 6 天」已走到 86% 的
+// 紧迫度，「还剩 1 天」是 99% —— 两者只差 1.16 倍，永远翻不过 credits 基数（实测：线性
+// 下把 Max 调到 100 也压不过）。sqrt 让最后几小时才陡升：6 天 → 7% 行程、1 天 → 92%，差距
+// 拉到 ~12 倍，才够压过「余量 10 倍差」。
+//
+// 软偏好语义不变：始终只是权重上的一个有限倍率（≤ Max），不会把流量全压到单一账号。
+// 未注入窗口（expiringWindow <= 0，如单测/嵌入方未给第二参）时退回旧的固定倍率，
+// 结果与旧实现逐字节一致。
+func (p *Pool) expiringUrgency(e *entry, now time.Time) float64 {
+	if e == nil || !expiringNow(e, now) {
+		return 1
 	}
-	return w
+	if p.expiringWindow <= 0 {
+		return expiringVirtualSlots // ponytail: 无窗口信息 → 保持旧口径
+	}
+	remain := e.creditsEarliestExpiry.Sub(now)
+	if remain >= p.expiringWindow {
+		return expiringUrgencyMin
+	}
+	frac := math.Sqrt(float64(remain) / float64(p.expiringWindow)) // T/W ∈ (0,1)
+	return expiringUrgencyMin + (expiringUrgencyMax-expiringUrgencyMin)*(1-frac)
+}
+
+// routingWeightOf 在普通账号权重上叠加紧迫度倍率。prefer_expiring=false 或账号无
+// 有效快过期批次时，结果与旧 weightOf 完全一致（不降权、不叠倍率）。
+func (p *Pool) routingWeightOf(e *entry, maxCredits int64, now time.Time) float64 {
+	if !p.preferExpiring {
+		return p.weightOf(e, maxCredits, now)
+	}
+	u := p.expiringUrgency(e, now)
+	if u == 1 {
+		return p.weightOf(e, maxCredits, now)
+	}
+	// 未注入窗口（u 走固定倍率回退）= 兼容口径：只叠倍率、不降权，与旧实现逐字节一致。
+	scale := 1.0
+	if p.expiringWindow > 0 {
+		scale = expiringCreditScale // 梯度生效：紧迫度为主轴、余额为次轴
+	}
+	return p.weightOfScaled(e, maxCredits, now, scale) * u
+}
+
+// weightScale 权重定点放大：int64 累加后抽签，保持随机源注入（randInt64N）语义不变。
+const weightScale = 1_000_000
+
+// pickByShare 在配了占比的账号里按 share 抽签（issue #62）：权重 = share，归一化后即比例。
+// 不套 minPickGap：占比的语义就是「流量按这个比例分给这几号」，硬压间隔会让比例失真；
+// 而在途上限/冷却/停牌已逐出不可用号，占满的号自动退出本次抽签，请求不会堆在单号上。
+// share 极小（< 1/weightScale）时钳到最小权重，避免整轮权重归零退化成均匀随机——
+// 那会让「1% 的号」和「99% 的号」一样多。
+func (p *Pool) pickByShare(cands []*entry) *entry {
+	weights := make([]int64, len(cands))
+	for i, e := range cands {
+		w := int64(p.shareOf(e.a.UID) * weightScale)
+		if w <= 0 {
+			w = 1
+		}
+		weights[i] = w
+	}
+	return p.drawWeighted(cands, weights)
+}
+
+// drawWeighted 定点权重抽签（weights 与 cands 等长、同序）。权重和 <= 0 时退化为均匀随机。
+// 随机源优先用 p.randInt64N（仅供测试注入确定性），nil 时回退 math/rand/v2 全局源。
+func (p *Pool) drawWeighted(cands []*entry, weights []int64) *entry {
+	var total int64
+	for _, w := range weights {
+		total += w
+	}
+	rnd := rand.Int64N
+	if p.randInt64N != nil {
+		rnd = p.randInt64N
+	}
+	if total <= 0 {
+		return cands[int(rnd(int64(len(cands))))]
+	}
+	r := rnd(total)
+	var acc int64
+	for i, e := range cands {
+		acc += weights[i]
+		if r < acc {
+			return e
+		}
+	}
+	return cands[len(cands)-1]
 }
 
 // SetCredits 更新账号余额。

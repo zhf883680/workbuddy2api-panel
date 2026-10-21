@@ -3,6 +3,7 @@ package upstream
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -173,12 +174,12 @@ func TestStripToolCallNames(t *testing.T) {
 	getFn := func(f map[string]any) map[string]any {
 		return f["choices"].([]any)[0].(map[string]any)["delta"].(map[string]any)["tool_calls"].([]any)[0].(map[string]any)["function"].(map[string]any)
 	}
-	seen := map[int]bool{}
+	seen := map[string]bool{}
 
 	// 首片带 name：保留，seen 建立
 	f0 := mkFrame(0, "lookup", "")
 	stripToolCallNames(f0, seen)
-	if !seen[0] {
+	if !seen["i:0"] {
 		t.Fatal("index 0 should be marked seen after first chunk")
 	}
 	if getFn(f0)["name"] != "lookup" {
@@ -211,7 +212,7 @@ func TestStripToolCallNames(t *testing.T) {
 	if getFn(f3)["name"] != "other" {
 		t.Errorf("index 1 first name=%v want other", getFn(f3)["name"])
 	}
-	if !seen[1] {
+	if !seen["i:1"] {
 		t.Error("index 1 should be marked seen")
 	}
 
@@ -404,6 +405,67 @@ func streamFrames(t *testing.T, raw string) (frames []map[string]any, doneCount 
 		}
 	}
 	return frames, doneCount
+}
+
+// TestStreamInStreamErrorFrame 上游把失败塞在 HTTP 200 的流里（顶层 {code,msg,displayMsg}、
+// 无 choices、无 error）：此前 normalizeFrame 的白名单把 code/msg 一并剥掉，客户端只看到
+// 「干净地停止、无任何失败」，我们的日志也只剩「段无 finish 结束」。现在如实透出为 error 帧。
+// 判据必须**窄**：带 choices 的帧（正文里出现 11140 / request illegal 是常态）与只有 usage
+// 的帧都不得被改写。
+func TestStreamInStreamErrorFrame(t *testing.T) {
+	raw := "data: {\"id\":\"x1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"正文在讨论 11140 与 request illegal 的语义\"}}]}\n\n" +
+		"data: {\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2,\"total_tokens\":3}}\n\n" +
+		"data: {\"code\":11140,\"msg\":\"request illegal\",\"displayMsg\":\"请求被安全策略拦截\",\"requestId\":\"rid-1\"}\n\n" +
+		"data: [DONE]\n\n"
+	frames, done := streamFrames(t, raw)
+	if done != 1 {
+		t.Fatalf("done=%d want 1", done)
+	}
+	if len(frames) != 3 {
+		t.Fatalf("frames=%d want 3（正文帧 + usage 帧 + error 帧）：%v", len(frames), frames)
+	}
+	if chs, _ := frames[0]["choices"].([]any); len(chs) != 1 {
+		t.Fatalf("带 choices 的正文帧不得改写：%v", frames[0])
+	}
+	if _, has := frames[1]["error"]; has {
+		t.Fatalf("只有 usage 的帧不得被当成失败帧：%v", frames[1])
+	}
+	e, ok := frames[2]["error"].(map[string]any)
+	if !ok {
+		t.Fatalf("内嵌失败帧应透出为 error 帧，实际：%v", frames[2])
+	}
+	if e["code"].(float64) != 11140 || e["message"] != "request illegal" || e["requestId"] != "rid-1" {
+		t.Fatalf("error 帧内容=%v want code=11140 message=request illegal requestId=rid-1", e)
+	}
+	if _, has := frames[2]["choices"]; has {
+		t.Fatalf("error 帧不应带 choices：%v", frames[2])
+	}
+}
+
+// TestStreamErrorFramePredicate 判据本身的边界（无 choices 才认；displayMsg 兜底 message；
+// 非 JSON 数字 / 缺 code / 无 error 缺 code 都不算）。
+func TestStreamErrorFramePredicate(t *testing.T) {
+	cases := []struct {
+		name string
+		obj  map[string]any
+		code int
+		msg  string
+		ok   bool
+	}{
+		{"典型拦截", map[string]any{"code": float64(11140), "msg": "request illegal"}, 11140, "request illegal", true},
+		{"displayMsg 兜底", map[string]any{"code": float64(11140), "displayMsg": "拦截"}, 11140, "拦截", true},
+		{"带 choices 的正文", map[string]any{"code": float64(11140), "choices": []any{}}, 0, "", false},
+		{"标准 error 帧让给既有分支", map[string]any{"code": float64(11140), "error": map[string]any{}}, 0, "", false},
+		{"只有 usage", map[string]any{"usage": map[string]any{}}, 0, "", false},
+		{"code 非数字", map[string]any{"code": "11140"}, 0, "", false},
+		{"code 为 0", map[string]any{"code": float64(0)}, 0, "", false},
+	}
+	for _, c := range cases {
+		code, msg, ok := StreamErrorFrame(c.obj)
+		if code != c.code || msg != c.msg || ok != c.ok {
+			t.Errorf("%s: got (%d,%q,%v) want (%d,%q,%v)", c.name, code, msg, ok, c.code, c.msg, c.ok)
+		}
+	}
 }
 
 func TestNormalizeFrame(t *testing.T) {
@@ -680,16 +742,18 @@ func TestAggregateEmptyStreamError(t *testing.T) {
 	}
 }
 
-// TestStreamEmptyFramesCase 覆盖流式空流检测：0 有效帧时写 error 帧（error 字段存活）,
-// 恰好一个 [DONE]，并返回非 nil error。
+// TestStreamEmptyFramesCase 覆盖流式空流检测：尚未写出字节的形态走首帧否决
+// （零字节 + HeadVetoError，交上层换号）；已经写过注释行、响应头已提交的形态
+// 只能旧兜底——写 error 帧（error 字段存活）+ 恰好一个 [DONE]。
 func TestStreamEmptyFramesCase(t *testing.T) {
 	cases := []struct {
 		name string
 		raw  string
+		veto bool
 	}{
-		{"空流", ""},
-		{"只有注释行", ": comment\n\n"},
-		{"只有 DONE", "data: [DONE]\n\n"},
+		{"空流", "", true},
+		{"只有注释行", ": comment\n\n", false},
+		{"只有 DONE", "data: [DONE]\n\n", true},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -697,6 +761,16 @@ func TestStreamEmptyFramesCase(t *testing.T) {
 			err := Stream(rec, strings.NewReader(c.raw))
 			if err == nil {
 				t.Fatalf("expected error, got nil")
+			}
+			if c.veto {
+				var hv *HeadVetoError
+				if !errors.As(err, &hv) || hv.Payload != "" {
+					t.Fatalf("err=%v want *HeadVetoError{Payload:\"\"}", err)
+				}
+				if body := rec.Body.String(); body != "" {
+					t.Fatalf("首帧否决必须零字节写出，实际：%q", body)
+				}
+				return
 			}
 			body := rec.Body.String()
 			if n := strings.Count(body, "data: [DONE]"); n != 1 {
@@ -723,6 +797,25 @@ func TestStreamEmptyFramesCase(t *testing.T) {
 				t.Errorf("error frame absent or error field stripped: %q", body)
 			}
 		})
+	}
+}
+
+// TestStreamHeadVetoErrorFrame 首帧即上游 error 帧：网关一个字节都不写就返回
+// HeadVetoError（携带该帧原文），上层据此换号重试，客户端不会看到「200 + error 帧」。
+// 对照：正文之后才出现的 error 帧照旧透传（TestStreamInStreamErrorFrame）。
+func TestStreamHeadVetoErrorFrame(t *testing.T) {
+	const frame = `{"error":{"message":"rate limited","code":6004}}`
+	rec := httptest.NewRecorder()
+	err := Stream(rec, strings.NewReader("data: "+frame+"\n\ndata: [DONE]\n\n"))
+	var hv *HeadVetoError
+	if !errors.As(err, &hv) {
+		t.Fatalf("err=%v want *HeadVetoError", err)
+	}
+	if hv.Payload != frame {
+		t.Errorf("payload=%q want %q", hv.Payload, frame)
+	}
+	if body := rec.Body.String(); body != "" {
+		t.Fatalf("首帧否决必须零字节写出，实际：%q", body)
 	}
 }
 
@@ -833,43 +926,33 @@ func TestNormalizeUsageCacheAliasesPreservesZeroResult(t *testing.T) {
 	}
 }
 
-// TestStreamHintErrorFrameObserver 上游 error 帧必须旁路通知观察者（账号处置挂载点），
-// 且透传字节不变——error 帧原文（code/msg/requestId）照常到达客户端。
-// 正常数据帧不得触发观察者。移植自 OkRoromori 分支的 WithErrorFrameObserver。
-func TestStreamHintErrorFrameObserver(t *testing.T) {
-	const errPayload = `{"error":{"code":6004,"message":"模型限流，将在 2026-09-27 01:00:00 重置"}}`
-	raw := "data: {\"id\":\"x1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n" +
-		"data: " + errPayload + "\n\n" +
-		"data: [DONE]\n\n"
-
-	var observed []string
-	rec := httptest.NewRecorder()
-	if err := StreamHint(rec, strings.NewReader(raw), nil, WithErrorFrameObserver(func(payload string) {
-		observed = append(observed, payload)
-	})); err != nil {
-		t.Fatal(err)
+func TestCreditPackagesExpiryTimestamp(t *testing.T) {
+	end := time.Now().In(softRateResetLoc).Add(7 * 24 * time.Hour).Truncate(time.Second)
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		if !strings.HasSuffix(r.URL.Path, "/v2/billing/meter/get-user-resource") {
+			return nil, errors.New("wrong path: " + r.URL.Path)
+		}
+		return jsonResp(200, `{"code":0,"data":{"Response":{"Data":{"Accounts":[`+
+			`{"PackageName":"gift","CycleCapacitySize":100,"CycleCapacityRemain":80,"CycleCapacityUsed":20,"CycleEndTime":"`+
+			end.Format(packageEndLayout)+`"},`+
+			`{"PackageName":"unknown","CycleCapacitySize":10,"CycleCapacityRemain":10,"CycleCapacityUsed":0}`+
+			`]}}}}`), nil
+	})
+	packs, remain, size, err := c.CreditPackages(&auth.Auth{AccessToken: "at", UID: "u1"})
+	if err != nil {
+		t.Fatalf("packages: %v", err)
 	}
-
-	if len(observed) != 1 || observed[0] != errPayload {
-		t.Fatalf("观察者回调 = %v want [%s]", observed, errPayload)
+	if remain != 90 || size != 110 {
+		t.Fatalf("remain/size=%d/%d want 90/110", remain, size)
 	}
-	// 透传字节不变：error 帧原文必须仍在响应里（error-passthrough 语义）。
-	if !strings.Contains(rec.Body.String(), "6004") {
-		t.Fatalf("error 帧原文未透传: %s", rec.Body.String())
+	var found bool
+	for _, p := range packs {
+		if p.Name == "gift" {
+			found = p.ExpiresAt == end.UnixMilli()
+		}
 	}
-
-	// 正常流（无 error 帧）：观察者零回调。
-	var normalObserved int
-	raw2 := "data: {\"id\":\"x2\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"}}]}\n\n" +
-		"data: [DONE]\n\n"
-	rec2 := httptest.NewRecorder()
-	if err := StreamHint(rec2, strings.NewReader(raw2), nil, WithErrorFrameObserver(func(payload string) {
-		normalObserved++
-	})); err != nil {
-		t.Fatal(err)
-	}
-	if normalObserved != 0 {
-		t.Fatalf("正常流触发了观察者 %d 次，want 0", normalObserved)
+	if !found {
+		t.Fatalf("gift pack missing Unix-ms expiry: %+v", packs)
 	}
 }
 
@@ -903,33 +986,86 @@ func TestUserResourceDetailedWithExpirySnapshot(t *testing.T) {
 		t.Fatalf("earliest=%v/%d want %v/25", earliestAt, earliestRemaining, soon)
 	}
 }
-func TestCreditPackagesExpiryTimestamp(t *testing.T) {
-	end := time.Now().In(softRateResetLoc).Add(7 * 24 * time.Hour).Truncate(time.Second)
-	c := testClient(func(r *http.Request) (*http.Response, error) {
-		if !strings.HasSuffix(r.URL.Path, "/v2/billing/meter/get-user-resource") {
-			return nil, errors.New("wrong path: " + r.URL.Path)
-		}
-		return jsonResp(200, `{"code":0,"data":{"Response":{"Data":{"Accounts":[`+
-			`{"PackageName":"gift","CycleCapacitySize":100,"CycleCapacityRemain":80,"CycleCapacityUsed":20,"CycleEndTime":"`+
-			end.Format(packageEndLayout)+`"},`+
-			`{"PackageName":"unknown","CycleCapacitySize":10,"CycleCapacityRemain":10,"CycleCapacityUsed":0}`+
-			`]}}}}`), nil
-	})
-	packs, remain, size, err := c.CreditPackages(&auth.Auth{AccessToken: "at", UID: "u1"})
+
+// TestDeductionEndTimePreferredOverCycleEnd 套餐型包的到期判据取 DeductionEndTime
+// （真实扣费截止），不是 CycleEndTime（只是月度计量周期）——后者会把 8 年有效的
+// 「个人体验版」积分误判成「快到期」而优先烧掉（2026-10-03 实测：cycle=2026-10-31
+// vs deduction=2034-12-24，余额 500）。两条消费路径（逐包明细 / 快到期快照）同源。
+func TestDeductionEndTimePreferredOverCycleEnd(t *testing.T) {
+	now := time.Now().In(softRateResetLoc)
+	cycle := now.Add(20 * 24 * time.Hour).Truncate(time.Second) // 月度周期：20 天后
+	deduction := now.AddDate(8, 0, 0).Truncate(time.Second)     // 真实扣费截止：8 年后
+	payload := `{"code":0,"data":{"Response":{"Data":{"Accounts":[` +
+		`{"PackageName":"trial","CycleCapacitySize":500,"CycleCapacityRemain":500,"CycleCapacityUsed":0,` +
+		`"CycleEndTime":"` + cycle.Format(packageEndLayout) + `",` +
+		`"DeductionEndTime":` + fmt.Sprintf("%d", deduction.UnixMilli()) + `}` +
+		`]}}}}`
+	c := testClient(func(r *http.Request) (*http.Response, error) { return jsonResp(200, payload), nil })
+
+	packs, _, _, err := c.CreditPackages(&auth.Auth{AccessToken: "at", UID: "u1"})
 	if err != nil {
 		t.Fatalf("packages: %v", err)
 	}
-	if remain != 90 || size != 110 {
-		t.Fatalf("remain/size=%d/%d want 90/110", remain, size)
+	if len(packs) != 1 || packs[0].ExpiresAt != deduction.UnixMilli() {
+		t.Fatalf("逐包到期应取 deduction %v，实得 %+v", deduction.UnixMilli(), packs)
 	}
-	var found bool
-	for _, p := range packs {
-		if p.Name == "gift" {
-			found = p.ExpiresAt == end.UnixMilli()
-		}
+	_, _, expiring, earliestAt, _, err := c.UserResourceDetailedWithExpiry(
+		&auth.Auth{AccessToken: "at", UID: "u1"}, 48*time.Hour,
+	)
+	if err != nil {
+		t.Fatalf("resource: %v", err)
 	}
-	if !found {
-		t.Fatalf("gift pack missing Unix-ms expiry: %+v", packs)
+	if expiring != 0 {
+		t.Fatalf("8 年后到期的包不得计入 48h 快到期窗口：expiring=%d", expiring)
+	}
+	if !earliestAt.Equal(deduction) {
+		t.Fatalf("earliestAt=%v want %v", earliestAt, deduction)
+	}
+}
+
+// TestUserResourceSnapshotBuckets 快照按自然日聚合：同一自然日的多个包合并成一个桶，
+// 日期取该日、剩余量求和、ExpireAt 取该日最早时刻；earliestRemaining 同步为该日合计。
+// 这是首页「到期提醒」与「积分构成」同口径的关键——旧实现只记最早单包，同日多包被少算。
+func TestUserResourceSnapshotBuckets(t *testing.T) {
+	now := time.Now().In(softRateResetLoc)
+	at := func(offset, hour int) time.Time {
+		return time.Date(now.Year(), now.Month(), now.Day()+offset, hour, 0, 0, 0, softRateResetLoc)
+	}
+	d2a, d2b, d5 := at(2, 9), at(2, 15), at(5, 9)
+	cycle := at(20, 0) // 月度周期边界：快照必须优先 DeductionEndTime，不能落在这里
+	payload := `{"code":0,"data":{"Response":{"Data":{"Accounts":[` +
+		`{"PackageName":"a","CapacitySize":60,"CapacityRemain":60,"CapacityUsed":0,` +
+		`"CycleEndTime":"` + cycle.Format(packageEndLayout) + `","DeductionEndTime":` + fmt.Sprintf("%d", d2a.UnixMilli()) + `},` +
+		`{"PackageName":"b","CapacitySize":40,"CapacityRemain":40,"CapacityUsed":0,` +
+		`"CycleEndTime":"` + cycle.Format(packageEndLayout) + `","DeductionEndTime":` + fmt.Sprintf("%d", d2b.UnixMilli()) + `},` +
+		`{"PackageName":"c","CapacitySize":25,"CapacityRemain":25,"CapacityUsed":0,` +
+		`"CycleEndTime":"` + cycle.Format(packageEndLayout) + `","DeductionEndTime":` + fmt.Sprintf("%d", d5.UnixMilli()) + `}` +
+		`]}}}}`
+	c := testClient(func(r *http.Request) (*http.Response, error) { return jsonResp(200, payload), nil })
+
+	remain, total, _, earliestAt, earliestRemaining, buckets, err := c.UserResourceSnapshot(
+		&auth.Auth{AccessToken: "at", UID: "u1"}, 0,
+	)
+	if err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+	if remain != 125 || total != 125 {
+		t.Fatalf("remain/total=%d/%d want 125/125", remain, total)
+	}
+	if len(buckets) != 2 {
+		t.Fatalf("buckets=%+v want 2 个自然日", buckets)
+	}
+	if buckets[0].Date != d2a.Format("2006-01-02") || buckets[0].Remain != 100 {
+		t.Fatalf("首桶=%+v want %s/100（同日两包合并）", buckets[0], d2a.Format("2006-01-02"))
+	}
+	if !buckets[0].ExpireAt.Equal(d2a) {
+		t.Fatalf("首桶 ExpireAt=%v want 该日最早 %v", buckets[0].ExpireAt, d2a)
+	}
+	if buckets[1].Date != d5.Format("2006-01-02") || buckets[1].Remain != 25 {
+		t.Fatalf("次桶=%+v want %s/25", buckets[1], d5.Format("2006-01-02"))
+	}
+	if !earliestAt.Equal(d2a) || earliestRemaining != 100 {
+		t.Fatalf("earliest=%v/%d want %v/100", earliestAt, earliestRemaining, d2a)
 	}
 }
 

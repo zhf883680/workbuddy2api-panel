@@ -4,12 +4,16 @@ package pool
 
 import (
 	"encoding/json"
+	"errors"
+	"io/fs"
 	"log"
+	"math"
 	"os"
 	"path/filepath"
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/safefile"
 )
 
 var flushInterval = 5 * time.Second
@@ -96,8 +100,10 @@ func (p *Pool) startFlusher() {
 			select {
 			case <-t.C:
 				p.mu.Lock()
-				if p.dirty.Swap(false) {
-					p.saveLocked()
+				// 落盘失败 → 把 dirty 置回：变更仍待写，下一 tick 重试（失败日志由
+				// notePersistFail 节流）。此前 dirty 在写盘前就被清掉，一败即永久搁置。
+				if p.dirty.Swap(false) && !p.saveLocked() {
+					p.dirty.Store(true)
 				}
 				p.mu.Unlock()
 			case <-stopCh:
@@ -110,20 +116,30 @@ func (p *Pool) startFlusher() {
 // Flush 同步把内存状态落盘（幂等：无变更不写盘）。供进程退出前调用。
 func (p *Pool) Flush() {
 	p.mu.Lock()
-	if p.dirty.Swap(false) {
-		p.saveLocked()
+	if p.dirty.Swap(false) && !p.saveLocked() {
+		p.dirty.Store(true) // 同上：失败置回，留给下一次 Flush/后台 tick 重试
 	}
 	p.mu.Unlock()
 }
 
 // Add 加入账号；已存在则保留原状态、更新凭证（upsert 单账号，不影响其他账号）。
 func (p *Pool) load() {
-	raw, err := os.ReadFile(p.stateFp)
+	// safefile.Read：正文坏（掉电留全 0、被截断）时回退 state.json.bak，两边都坏
+	// 才放弃。文件不存在是首次启动，保持静默。
+	raw, err := safefile.Read(p.stateFp, nil)
 	if err != nil {
+		if !errors.Is(err, fs.ErrNotExist) {
+			log.Printf("pool: state.json 不可用（%v），跳过本地状态恢复: %s", err, p.stateFp)
+		}
 		return
 	}
 	var sf stateFile
-	if json.Unmarshal(raw, &sf) != nil {
+	if err := json.Unmarshal(raw, &sf); err != nil {
+		// 损坏/截断的 state.json（写盘中途崩溃、磁盘满、手工改坏）此前被静默丢弃：
+		// 池子以 0 账号启动、credits/冷却/熔断计数全丢，而日志里一个字都没有——运维
+		// 只能看到"账号全没了"。原文件保留（供人工恢复），但必须留一条痕迹；
+		// 与 credithist 对同类解析失败的处理对齐。
+		log.Printf("pool: state.json 解析失败（%v），跳过本地状态恢复，原文件保留待人工处理: %s", err, p.stateFp)
 		return
 	}
 	p.applyAccountsLocked(sf.Accounts)
@@ -133,6 +149,7 @@ func (p *Pool) load() {
 // 本地 load() 与 Redis 快照恢复共用；调用方必须已持有 p.mu。
 func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 	now := time.Now()
+	migratedState := false
 	for uid, s := range accounts {
 		// err_total 优先；旧文件的 err_count（连续错误）作一次性迁移源映射进来（二者取较大者，
 		// 尽最大可能保留历史观测信号——旧语义下 err_count 也真实发生过错误，不应丢）。
@@ -143,6 +160,7 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 		e := &entry{
 			a:                        &auth.Auth{UID: uid}, // placeholder，Add 时会换成完整凭证
 			credits:                  s.Credits,
+			creditsRemainder:         s.CreditsRemainder,
 			creditsTotal:             s.CreditsTotal,
 			creditsExpiring:          s.CreditsExpiring,
 			creditsEarliestExpiry:    s.CreditsEarliestExpiry,
@@ -162,6 +180,11 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 			sessionDeadFails:         s.SessionDeadFails,
 			consecutiveFails:         s.ConsecutiveFails,
 		}
+		// 亚积分余量合法性：越界/非有限值（旧数据或手改）清 0，保守回退整数口径。
+		if math.IsNaN(e.creditsRemainder) || math.IsInf(e.creditsRemainder, 0) || e.creditsRemainder < -0.5 || e.creditsRemainder >= 0.5 {
+			e.creditsRemainder = 0
+			migratedState = true
+		}
 		// 到期快照按当前时刻惰性清洗：已过期、零剩余或超出总余额的脏数据不恢复。
 		if e.creditsExpiring < 0 {
 			e.creditsExpiring = 0
@@ -175,6 +198,13 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 		if e.creditsEarliestRemaining == 0 || e.creditsEarliestExpiry.IsZero() || !now.Before(e.creditsEarliestExpiry) {
 			e.creditsEarliestExpiry = time.Time{}
 			e.creditsEarliestRemaining = 0
+		}
+		// 按日到期批次：惰性剔除已过期/零剩余条目；有批次时以批次为准同步最早批次，
+		// 保证重启后首页快照与明细仍同口径。
+		e.expiryBuckets = sanitizeExpiryBuckets(s.CreditsExpiryBuckets, now)
+		if len(e.expiryBuckets) > 0 {
+			e.creditsEarliestExpiry = e.expiryBuckets[0].ExpireAt
+			e.creditsEarliestRemaining = e.expiryBuckets[0].Remain
 		}
 		// 熔断器持久化恢复：breakerUntil 未过期才恢复（过期不复活），retryCount 仅在
 		// 熔断仍有效时保留（否则归零，不保留无用退避指数）。
@@ -199,19 +229,28 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 			}
 		}
 		// 成本账本：惰性过滤过期（modelCostTTL 外不恢复）+ 剔除结构破损条目
-		// （负 per1k / 零 LastSeen——上游异常或旧文件手改产生的脏数据）。
+		// （负/非有限 per1k / 零 LastSeen）。旧版缺失 credit 与真实 0 混为同一
+		// 记录形态；仅对「缺少可信标记的零价条目」降为未知（迁移一次），
+		// 正价旧记录保持可用（迁移上游 PR #104）。
 		if len(s.ModelCosts) > 0 {
 			for m, mc := range s.ModelCosts {
-				if mc.LastSeen.IsZero() || now.Sub(mc.LastSeen) > modelCostTTL || mc.CostPer1k < 0 {
+				if mc.LastSeen.IsZero() || now.Sub(mc.LastSeen) > modelCostTTL || mc.CostPer1k < 0 || math.IsNaN(mc.CostPer1k) || math.IsInf(mc.CostPer1k, 0) {
+					continue
+				}
+				if mc.CostPer1k == 0 && !mc.CreditVerified {
+					migratedState = true
 					continue
 				}
 				if e.modelCost == nil {
 					e.modelCost = map[string]modelCostEntry{}
 				}
-				e.modelCost[m] = modelCostEntry{CostPer1k: mc.CostPer1k, LastSeen: mc.LastSeen, Samples: mc.Samples}
+				e.modelCost[m] = modelCostEntry{CostPer1k: mc.CostPer1k, LastSeen: mc.LastSeen, Samples: mc.Samples, CreditVerified: mc.CreditVerified}
 			}
 		}
 		p.byUID[uid] = e
+	}
+	if migratedState {
+		p.dirty.Store(true)
 	}
 }
 
@@ -228,27 +267,28 @@ func (p *Pool) applySnapshotLocked(s snapshot) {
 	p.byUID = map[string]*entry{}
 	p.applyAccountsLocked(s.Accounts)
 }
-func (p *Pool) saveLocked() {
+
+// saveLocked 落盘当前状态（调用方须持 p.mu）。返回是否成功：调用方在"先清 dirty
+// 再写盘"的路径上必须依据返回值把 dirty 置回，否则写盘失败后 dirty 已被清掉、磁盘
+// 恢复也不会补写，这段内存变更要等到下一次状态变更才碰巧落盘（进程在此期间退出就丢）。
+func (p *Pool) saveLocked() bool {
 	if p.stateFp == "" {
-		return
+		return true
 	}
 	sf := p.stateOverviewLocked()
 	raw, err := json.MarshalIndent(sf, "", "  ")
 	if err != nil {
 		p.notePersistFail(err)
-		return
+		return false
 	}
 	if dir := filepath.Dir(p.stateFp); dir != "" {
 		_ = os.MkdirAll(dir, 0o755)
 	}
-	tmp := p.stateFp + ".tmp"
-	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+	// safefile：fsync 后 rename（掉电不会留下全 0 的 state.json），并把上一份
+	// 有效内容留成 .bak —— 读到坏文件时兜底，冷却/停牌状态不至于一次掉电全丢。
+	if err := safefile.WriteKeep(p.stateFp, raw, 0o600); err != nil {
 		p.notePersistFail(err)
-		return
-	}
-	if err := os.Rename(tmp, p.stateFp); err != nil {
-		p.notePersistFail(err)
-		return
+		return false
 	}
 	if p.persistFails > 0 {
 		// 从连续失败中恢复：打一条恢复日志，避免"错误打完却无人知道已恢复"。
@@ -262,6 +302,7 @@ func (p *Pool) saveLocked() {
 			p.store.SaveState(snapRaw)
 		}
 	}
+	return true
 }
 
 // notePersistFail 记录一次本地 state.json 落盘失败，并按节流规则决定是否打日志：
@@ -285,12 +326,10 @@ func (p *Pool) stateOverviewLocked() stateFile {
 	for uid, e := range p.byUID {
 		s := stateAccount{
 			Credits:                  e.credits,
+			CreditsRemainder:         e.creditsRemainder,
 			CreditsTotal:             e.creditsTotal,
 			Disabled:                 e.disabled,
 			Paused:                   e.paused,
-			Reason:                   e.reason,
-			Until:                    e.until,
-			CoolKind:                 e.coolKind,
 			SuccessCount:             e.successCount,
 			ErrTotal:                 e.errTotal,
 			LastSuccess:              e.lastSuccess,
@@ -303,6 +342,13 @@ func (p *Pool) stateOverviewLocked() stateFile {
 			CreditsExpiring:          e.creditsExpiring,
 			CreditsEarliestExpiry:    e.creditsEarliestExpiry,
 			CreditsEarliestRemaining: e.creditsEarliestRemaining,
+			CreditsExpiryBuckets:     append([]ExpiryBucket(nil), e.expiryBuckets...),
+		}
+		// 账号级冷却字段：仅禁用或仍在冷却时限内落盘（与熔断/降权同款惰性清洗）。
+		// 软冷却按墙钟到期、字段本身不清理，无条件落盘会让过期 reason 在 state.json 里
+		// 长生不老并被重启原样拾回（issue #207-4）。
+		if e.disabled || (!e.until.IsZero() && now.Before(e.until)) {
+			s.Reason, s.Until, s.CoolKind = e.reason, e.until, e.coolKind
 		}
 		// 熔断截止：仅未过期才落盘（指针 nil 才能被 omitempty 真省略）。
 		if !e.breakerUntil.IsZero() && now.Before(e.breakerUntil) {
@@ -336,7 +382,7 @@ func (p *Pool) stateOverviewLocked() stateFile {
 				if s.ModelCosts == nil {
 					s.ModelCosts = map[string]stateModelCost{}
 				}
-				s.ModelCosts[m] = stateModelCost{CostPer1k: mc.CostPer1k, LastSeen: mc.LastSeen, Samples: mc.Samples}
+				s.ModelCosts[m] = stateModelCost{CostPer1k: mc.CostPer1k, LastSeen: mc.LastSeen, Samples: mc.Samples, CreditVerified: mc.CreditVerified}
 			}
 		}
 		sf.Accounts[uid] = s

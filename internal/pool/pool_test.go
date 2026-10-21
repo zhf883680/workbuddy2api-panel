@@ -416,6 +416,28 @@ func TestNoteSuccessIncrementsAndRecords(t *testing.T) {
 	}
 }
 
+// Reason 只在冷却/禁用时透出（issue #171-1）：软冷却按墙钟恢复，到期后 until/coolKind/
+// reason 字段留在内存里不会被清理（NoteSuccess 只清熔断/连败，不碰这些），若无条件透出，
+// 面板会在「可用」旁边挂一条一周前的「429 rate limit」。
+func TestStatusReasonOnlyWhileCooling(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.Cooldown("u1", CoolSoft, time.Hour, "429 rate limit")
+	st, _ := p.Status("u1")
+	if !st.Cooling || st.Reason != "429 rate limit" {
+		t.Fatalf("冷却中应透出原因: cooling=%v reason=%q", st.Cooling, st.Reason)
+	}
+	// 冷却到期（字段仍在，无人清理）
+	p.Cooldown("u1", CoolSoft, -time.Second, "429 rate limit")
+	st2, _ := p.Status("u1")
+	if st2.Cooling {
+		t.Fatalf("until 已过期不应再算冷却: %+v", st2)
+	}
+	if st2.Reason != "" {
+		t.Errorf("到期后不得透出过期 reason: %q（面板会「可用」+ 过期限流文案并排）", st2.Reason)
+	}
+}
+
 func TestReenableClearsCoolingNotBreaker(t *testing.T) {
 	// C5：签到解冻只清冷却（until/coolKind/reason）+ 更新 credits，不清熔断
 	// （fails/retryCount/breakerUntil）。签到成功只证明余额与 billing 通道恢复，
@@ -1740,6 +1762,94 @@ func TestTokenUsagePersistsAcrossReload(t *testing.T) {
 	}
 }
 
+// TestAllHardCreditForRealm 只有「挡路的全是余额耗尽冷却」才判积分耗尽：
+// 健康号/软冷却/禁用号在场，或空池，都必须 false（不越权声称积分耗尽）。
+func TestAllHardCreditForRealm(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "hc"})
+	p.CooldownUntilTomorrow4AM("hc", "余额不足")
+	if !p.AllHardCreditForRealm("") {
+		t.Fatal("全池余额耗尽冷却应判 true")
+	}
+	p.Add(&auth.Auth{UID: "healthy"})
+	if p.AllHardCreditForRealm("") {
+		t.Fatal("场内出现健康号应判 false")
+	}
+
+	soft := New("")
+	soft.Add(&auth.Auth{UID: "s"})
+	soft.CooldownSoftRate("s", time.Minute, time.Time{}, "429")
+	if soft.AllHardCreditForRealm("") {
+		t.Fatal("软冷却不是积分耗尽，应判 false")
+	}
+
+	dis := New("")
+	dis.Add(&auth.Auth{UID: "d"})
+	dis.Disable("d", "manual")
+	if dis.AllHardCreditForRealm("") {
+		t.Fatal("有禁用号应判 false")
+	}
+
+	if New("").AllHardCreditForRealm("") {
+		t.Fatal("空池应判 false")
+	}
+}
+
+// TestReserveCreditsParksAccount 保留积分：余额**已知**且 <= 阈值 → 停牌（不接单，
+// 含全冷却兜底路径）；阈值 0 / 余额未知 → 不受影响（新装不能看起来整池不可用）。
+func TestReserveCreditsParksAccount(t *testing.T) {
+	withNoPickGap(t)
+	p := New("")
+	p.Add(&auth.Auth{UID: "a"})
+	p.Add(&auth.Auth{UID: "b"})
+	p.SetCredits("a", 10, 100) // 已知余额 10
+	p.SetCredits("b", 100, 100)
+
+	if p.Pick() == nil {
+		t.Fatal("阈值 0（默认关闭）时应有账号可接单")
+	}
+
+	p.SetReserveCredits(10)
+	st, _ := p.Status("a")
+	if !st.ReserveBlocked {
+		t.Fatalf("余额 == 阈值 应停牌: %+v", st)
+	}
+	if stB, _ := p.Status("b"); stB.ReserveBlocked {
+		t.Fatal("余额高于阈值不该停牌")
+	}
+	for i := 0; i < 20; i++ {
+		if got := p.Pick(); got == nil || got.UID != "b" {
+			t.Fatalf("停牌号被选中（第 %d 次）: %+v", i, got)
+		}
+	}
+
+	// 全池停牌：主路径与全冷却兜底都不能再交出账号。
+	p.SetCredits("b", 5, 100)
+	if got := p.Pick(); got != nil {
+		t.Fatalf("全池停牌时不该再选出账号: %+v", got)
+	}
+	if stB, _ := p.Status("b"); !stB.ReserveBlocked {
+		t.Fatal("余额 5 <= 阈值 10 应停牌")
+	}
+
+	// 充值恢复（> 阈值）→ 立刻可接单。
+	p.SetCredits("b", 500, 500)
+	if p.Pick() == nil {
+		t.Fatal("充值后应恢复接单")
+	}
+
+	// 余额从未查过（creditsTotal == 0）：阈值再高也不拦。
+	q := New("")
+	q.Add(&auth.Auth{UID: "unknown"})
+	q.SetReserveCredits(1000)
+	if stU, _ := q.Status("unknown"); stU.ReserveBlocked {
+		t.Fatal("余额未知的账号不该停牌")
+	}
+	if q.Pick() == nil {
+		t.Fatal("余额未知的账号仍应可接单")
+	}
+}
+
 func TestPickPrefersExpiringByVirtualWeight(t *testing.T) {
 	withNoPickGap(t)
 	p := New("")
@@ -1803,7 +1913,7 @@ func TestPreferExpiringDisabledRestoresWeight(t *testing.T) {
 		t.Fatalf("enabled expiring weight=%v want %v", we, wn*expiringVirtualSlots)
 	}
 
-	p.SetPreferExpiring(false)
+	p.SetPreferExpiring(false, 0)
 
 	p.mu.Lock()
 	wa := p.routingWeightOf(p.byUID["a"], 100, now)
@@ -1940,6 +2050,49 @@ func TestReviveClearsPaused(t *testing.T) {
 	}
 }
 
+// TestReviveClearsDegrade 运维「解冻」是全清：连败降权（issue #114）一并解除。
+// 面板把「降权中」的账号同样显示成「解冻」，只清冷却/熔断会让点完按钮的账号仍被
+// degradeUntil 挡在池外——表现为「解冻无效」（借鉴 MOONKEY0510/workbuddy_api cd35e5c）。
+func TestReviveClearsDegrade(t *testing.T) {
+	withNoPickGap(t)
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(&auth.Auth{UID: "u2"}) // 健康对照：降权期内 u1 不应出现在 normal 选号
+	p.SetCredits("u1", 100, 100)
+	p.SetCredits("u2", 100, 100)
+	for i := 0; i < 20; i++ {
+		p.NoteFailures("u1") // 达阈即降权，阈值为池内默认
+	}
+	p.NoteFailures("u1")
+	p.NoteFailures("u1") // 降权期内再喂两笔（未达阈）：计数非零，供下方断言 Revive 清零
+	if st, _ := p.Status("u1"); st.DegradeUntil.IsZero() {
+		t.Fatalf("连败达阈应触发降权: %+v", st)
+	}
+	if st, _ := p.Status("u1"); st.ConsecutiveFails == 0 {
+		t.Fatalf("降权期内计数应为非零（否则下方清零断言无意义）: %+v", st)
+	}
+	for i := 0; i < 20; i++ {
+		if got := p.Pick(); got != nil && got.UID == "u1" {
+			t.Fatalf("降权期内 u1 不该被选中（第 %d 次）", i)
+		}
+	}
+	if !p.Revive("u1") {
+		t.Fatal("Revive 应返回 true")
+	}
+	if st, _ := p.Status("u1"); st.ConsecutiveFails != 0 || !st.DegradeUntil.IsZero() {
+		t.Errorf("Revive 应清连续失败计数与降权截止: %+v", st)
+	}
+	seen := false
+	for i := 0; i < 60 && !seen; i++ {
+		if got := p.Pick(); got != nil && got.UID == "u1" {
+			seen = true
+		}
+	}
+	if !seen {
+		t.Error("解冻后 u1 应重新参与选号")
+	}
+}
+
 // TestPausePersists 暂停状态落盘，跨重启不丢（轮换用法要求）。
 func TestPausePersists(t *testing.T) {
 	dir := t.TempDir()
@@ -1979,5 +2132,153 @@ func TestResumeIdempotent(t *testing.T) {
 	}
 	if st, _ := p.Status("u1"); st.Paused {
 		t.Errorf("Paused 应仍为 false: %+v", st)
+	}
+}
+
+// TestReserveFreeTierExempt 保命模式免费档豁免：额度见底的号对付费模型停牌，
+// 但免费档（目录倍率 x0.00）请求照常可选——额度耗尽连免费档也会 429 14018，
+// 见底的号要把最后额度留给免费模型（借鉴 swysgh/workbuddy2api reserve 分流）。
+func TestReserveFreeTierExempt(t *testing.T) {
+	withNoPickGap(t)
+	p := New("")
+	p.SetRandomSource(func(n int64) int64 { return 0 })
+	p.SetModelRateOf(rates(map[string]map[string]string{
+		"cn": {"glm-free": "0.00", "hy4-preview": "0.29"},
+	}))
+	p.Add(&auth.Auth{UID: "low"}) // 唯一账号，余额已到保留线
+	p.SetCredits("low", 5, 100)
+	p.SetReserveCredits(10)
+
+	// 付费模型：停牌（原语义不变）。
+	if a := p.PickExcludingForRealm(nil, "hy4-preview", ""); a != nil {
+		t.Fatalf("免费档豁免不该扩大到付费模型: %+v", a)
+	}
+	// 免费模型：豁免放行（新语义——此前同参数下这里是 nil）。
+	a := p.PickExcludingForRealm(nil, "glm-free", "")
+	if a == nil || a.UID != "low" {
+		t.Fatalf("免费档应放行见底号: got=%v", a)
+	}
+	// Status 展示与探活口径不受豁免影响：账号仍标记停牌（免费档放行是选号时点行为）。
+	if st, _ := p.Status("low"); !st.ReserveBlocked {
+		t.Fatalf("Status.ReserveBlocked 应保持 true（展示全停口径）: %+v", st)
+	}
+	if p.ServableNow() {
+		t.Fatal("ServableNow（探活）应维持全停口径：免费档豁免不改 healthz")
+	}
+	// 目录未覆盖的模型按付费处理（保守），同样停牌。
+	if a := p.PickExcludingForRealm(nil, "not-in-catalog", ""); a != nil {
+		t.Fatalf("目录未覆盖 = 未知倍率，应保守当付费停牌: %+v", a)
+	}
+}
+
+// TestStatusReasonHiddenAfterCooldownExpires 软冷却到期后 until/coolKind/reason 字段按设计
+// 不清理（Cooldown 写、NoteSuccess 不碰），而 Status 不应再把过期 reason 透出——否则面板会把
+// 「可用」和几天前的「429 rate limit」并排显示，运维分不清是历史残留还是当前限流（issue #171-1，
+// 上游 PR #202 的同款用例）。
+func TestStatusReasonHiddenAfterCooldownExpires(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	// 冷却中：reason 正常透出。
+	p.Cooldown("u1", CoolSoft, time.Hour, "429 rate limit")
+	st, ok := p.Status("u1")
+	if !ok || !st.Cooling || st.Reason != "429 rate limit" {
+		t.Fatalf("冷却中应透出 reason: %+v ok=%v", st, ok)
+	}
+	// 冷却到期、字段残留：不再透出（until 落在过去，字段仍在）。
+	p.Cooldown("u1", CoolSoft, -time.Minute, "429 rate limit")
+	st, ok = p.Status("u1")
+	if !ok || st.Cooling {
+		t.Fatalf("到期的冷却不应算 cooling: %+v", st)
+	}
+	if st.Reason != "" {
+		t.Fatalf("过期 reason 泄漏到 Status.Reason: %q", st.Reason)
+	}
+	// 禁用态仍要透出原因（DisabledReason 走另一条路，别被上面刀掉）。
+	p.Disable("u1", "12153 session dead")
+	st, _ = p.Status("u1")
+	if !st.Disabled || st.DisabledReason == "" {
+		t.Fatalf("禁用原因必须继续透出: %+v", st)
+	}
+}
+
+// TestExpiryBucketsFEFOAndPersistence 按日到期批次的三件事：
+//  1. 写入时按日期升序（同一天多包已在 upstream 合并）；
+//  2. NoteModelCost 按 FEFO 从最早桶扣，扣穿后顺延到下一桶，不再「最早一批归零就整行消失」；
+//  3. buckets 随 state.json 持久化，重启后首页快照仍是完整视图。
+func TestExpiryBucketsFEFOAndPersistence(t *testing.T) {
+	fp := filepath.Join(t.TempDir(), "state.json")
+	p := New(fp)
+	p.Add(&auth.Auth{UID: "u1"})
+	at3 := time.Now().Add(3 * 24 * time.Hour)
+	at10 := time.Now().Add(10 * 24 * time.Hour)
+	// 故意乱序写入：SetCreditsSnapshot 必须自己排序。
+	p.SetCreditsSnapshot("u1", CreditsSnapshot{
+		Remain: 250, Total: 250,
+		ExpiryBuckets: []ExpiryBucket{
+			{Date: at10.Format("2006-01-02"), ExpireAt: at10, Remain: 100},
+			{Date: at3.Format("2006-01-02"), ExpireAt: at3, Remain: 150},
+		},
+	})
+	st, ok := p.Status("u1")
+	if !ok || len(st.CreditsExpiryBuckets) != 2 {
+		t.Fatalf("buckets 未透出: %+v", st)
+	}
+	if st.CreditsExpiryBuckets[0].Date != at3.Format("2006-01-02") || st.CreditsEarliestRemaining != 150 {
+		t.Fatalf("首桶/最早剩余=%+v/%d want %s/150", st.CreditsExpiryBuckets[0], st.CreditsEarliestRemaining, at3.Format("2006-01-02"))
+	}
+
+	// 扣 120：首桶 150→30，最早批次仍是 3 天后。
+	p.NoteModelCost("u1", "m", 120, 1000)
+	st, _ = p.Status("u1")
+	if len(st.CreditsExpiryBuckets) != 2 || st.CreditsExpiryBuckets[0].Remain != 30 || st.CreditsEarliestRemaining != 30 {
+		t.Fatalf("第一轮扣减后=%+v 最早=%d want 首桶 30", st.CreditsExpiryBuckets, st.CreditsEarliestRemaining)
+	}
+	// 再扣 50：扣穿首桶（30），余 20 落到第二桶（100→80），最早批次顺延到 10 天后。
+	p.NoteModelCost("u1", "m", 50, 1000)
+	st, _ = p.Status("u1")
+	if len(st.CreditsExpiryBuckets) != 1 {
+		t.Fatalf("首桶应被移除，实得 %+v", st.CreditsExpiryBuckets)
+	}
+	if st.CreditsExpiryBuckets[0].Date != at10.Format("2006-01-02") || st.CreditsExpiryBuckets[0].Remain != 80 {
+		t.Fatalf("顺延后=%+v want %s/80", st.CreditsExpiryBuckets[0], at10.Format("2006-01-02"))
+	}
+	if !st.CreditsEarliestExpiry.Equal(at10) || st.CreditsEarliestRemaining != 80 {
+		t.Fatalf("最早批次未顺延: %v/%d want %v/80", st.CreditsEarliestExpiry, st.CreditsEarliestRemaining, at10)
+	}
+
+	// 落盘 → 重启恢复：批次与最早字段都要回来。
+	p.Flush()
+	p2 := New(fp)
+	defer p2.Close()
+	st2, ok := p2.Status("u1")
+	if !ok || len(st2.CreditsExpiryBuckets) != 1 || st2.CreditsExpiryBuckets[0].Remain != 80 {
+		t.Fatalf("重启后 buckets 丢失: %+v ok=%v", st2.CreditsExpiryBuckets, ok)
+	}
+	if !st2.CreditsEarliestExpiry.Equal(at10) || st2.CreditsEarliestRemaining != 80 {
+		t.Fatalf("重启后最早批次=%v/%d want %v/80", st2.CreditsEarliestExpiry, st2.CreditsEarliestRemaining, at10)
+	}
+}
+
+// TestStatusExposesSessionDeadFails 面板靠这个字段把「已被上游判死、还没到禁用阈值」的
+// 中间态打出来（否则上游批量注销会话后，号在 billing/chat 双侧 401，面板仍显示「可用」，
+// 直到每日保活连败满阈 ≈3 天才变灰，issue #215 复盘）。这里钉住 Status 的透出与 JSON 名。
+func TestStatusExposesSessionDeadFails(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.NoteSessionDead("u1")
+	st, ok := p.Status("u1")
+	if !ok || st.SessionDeadFails != 1 {
+		t.Fatalf("SessionDeadFails=%d want 1", st.SessionDeadFails)
+	}
+	b, err := json.Marshal(st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wire map[string]any
+	if err := json.Unmarshal(b, &wire); err != nil {
+		t.Fatal(err)
+	}
+	if v, ok := wire["session_dead_fails"]; !ok || v.(float64) != 1 {
+		t.Fatalf("JSON 字段 session_dead_fails 缺失或值不对: %s", b)
 	}
 }

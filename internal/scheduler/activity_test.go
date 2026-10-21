@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -332,6 +334,7 @@ func TestNextWakeActivityDisabled(t *testing.T) {
 		ActivityHours:    []int{10},
 		ActivityDisabled: true,
 		KeepaliveHours:   []int{22},
+		GrowthDisabled:   true, // 成长队列 11:00 会插在 9:30 与 21:00 之间，本用例只看活跃时点
 	})
 	at, kinds := s.nextWake(time.Date(2026, 9, 11, 9, 30, 0, 0, time.Local))
 	if want := time.Date(2026, 9, 11, 21, 0, 0, 0, time.Local); !at.Equal(want) {
@@ -371,6 +374,7 @@ func TestAllFourDisabledNoSpin(t *testing.T) {
 		ActivityDisabled:  true,
 		KeepaliveDisabled: true,
 		BlackcatDisabled:  true,
+		GrowthDisabled:    true,
 		CheckinHours:      []int{9, 21},
 		TravelHours:       []int{9},
 		ActivityHours:     []int{10},
@@ -378,7 +382,7 @@ func TestAllFourDisabledNoSpin(t *testing.T) {
 	})
 	at, kinds := s.nextWake(time.Now())
 	if !at.IsZero() || len(kinds) != 0 {
-		t.Errorf("at=%v kinds=%v want zero/nil（五类全禁用）", at, kinds)
+		t.Errorf("at=%v kinds=%v want zero/nil（六类全禁用）", at, kinds)
 	}
 }
 
@@ -582,11 +586,19 @@ func TestRunActivityNowGlobalErrorDoesNotSkipCN(t *testing.T) {
 // TestCheckinStillSkipsGlobal 回归护栏：本次只放开活跃上报，签到仍跳过 global
 // （上游 a190252 明确「checkin/travel 门控不动」）。误删该 gate 会让国际版去打
 // CN 专属签到端点。
+// TestCheckinStillSkipsGlobal 签到阶段不得对国际号发上游调用（D4：global 无 CN 签到体系，
+// 实测 workbuddy.ai 的 daily-checkin 回 400「签到活动未开启或已过期」）。
+// 注意：本函数尾部会跑连登管家，而连登管家对国际号**会**发 billing 域的礼包/补偿查询
+// （见 compensation.go 的 compSkipReason 注释），故断言的是「没有签到/成长域调用」，
+// 不是「零调用」。
 func TestCheckinStillSkipsGlobal(t *testing.T) {
 	withGlobalSwitch(t)
-	var hits atomic.Int32
+	var mu sync.Mutex
+	var paths []string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		hits.Add(1)
+		mu.Lock()
+		paths = append(paths, r.URL.Path)
+		mu.Unlock()
 		w.Write([]byte(`{"code":0,"data":{}}`))
 	}))
 	defer srv.Close()
@@ -605,7 +617,11 @@ func TestCheckinStillSkipsGlobal(t *testing.T) {
 
 	s.RunCheckinNow()
 
-	if n := hits.Load(); n != 0 {
-		t.Errorf("checkin global 上游调用=%d want 0（签到仍应跳过 global）", n)
+	mu.Lock()
+	defer mu.Unlock()
+	for _, p := range paths {
+		if strings.Contains(p, "daily-checkin") || strings.Contains(p, "/activity/") {
+			t.Errorf("国际号不该发起签到/成长域调用: %v", paths)
+		}
 	}
 }

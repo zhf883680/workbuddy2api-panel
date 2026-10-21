@@ -1,6 +1,8 @@
 package panel
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -17,6 +19,7 @@ func TestSecurityHeadersOnAllPanelResponses(t *testing.T) {
 	p := newTestPanel()
 	paths := []struct{ method, path string }{
 		{"GET", "/panel/"},
+		{"GET", "/panel/theme.js"},
 		{"GET", "/panel/app.js"},
 		{"GET", "/panel/api/overview"}, // 401（未提供 key）
 		{"POST", "/panel/api/config"},  // 401
@@ -70,8 +73,8 @@ func TestIndexReferencesExternalScript(t *testing.T) {
 	p.ServeHTTP(rec, httptest.NewRequest("GET", "/panel/", nil))
 	body := rec.Body.String()
 
-	if !strings.Contains(body, `<script src="app.js"></script>`) {
-		t.Error("index.html must load app.js externally (inline script is blocked by CSP)")
+	if !strings.Contains(body, `<script src="app.js?v=`) {
+		t.Error("index.html must load app.js externally with content fingerprint (inline script is blocked by CSP)")
 	}
 	// 反例保护：出现内联 <script>...</script> 内容块即为回归
 	if strings.Contains(body, "<script>\n") || strings.Contains(body, "<script> ") {
@@ -92,6 +95,81 @@ func TestAppScriptServed(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "'use strict'") {
 		t.Error("app.js body looks wrong")
+	}
+	if rec.Header().Get("Cache-Control") != "no-store" {
+		t.Errorf("Cache-Control=%q want no-store", rec.Header().Get("Cache-Control"))
+	}
+}
+
+// 页面里的脚本 URL 必须带内容指纹，且指纹与真发的脚本内容对得上（issue #33）。
+// 钉的是：URL 查询串里的 v= 就是所服务脚本的 sha256 前 8 字节——指纹算错/
+// 接错内容等于没防，这条断言把它钉死。
+func TestScriptURLsCarryContentFingerprint(t *testing.T) {
+	p := newTestPanel()
+
+	page := httptest.NewRecorder()
+	p.ServeHTTP(page, httptest.NewRequest("GET", "/panel/", nil))
+	body := page.Body.String()
+
+	appRec := httptest.NewRecorder()
+	p.ServeHTTP(appRec, httptest.NewRequest("GET", "/panel/app.js", nil))
+	themeRec := httptest.NewRecorder()
+	p.ServeHTTP(themeRec, httptest.NewRequest("GET", "/panel/theme.js", nil))
+
+	for _, c := range []struct {
+		name string
+		src  string
+		data string
+	}{
+		{"app.js", `src="app.js?v=`, appRec.Body.String()},
+		{"theme.js", `src="theme.js?v=`, themeRec.Body.String()},
+	} {
+		i := strings.Index(body, c.src)
+		if i < 0 {
+			t.Fatalf("%s 引用未带指纹: %s", c.name, c.src)
+		}
+		rest := body[i+len(c.src):]
+		j := strings.IndexByte(rest, '"')
+		if j < 8 {
+			t.Fatalf("%s 指纹形态异常: %q", c.name, rest[:min(j, len(rest))])
+		}
+		sum := sha256.Sum256([]byte(c.data))
+		want := hex.EncodeToString(sum[:8])
+		if got := rest[:j]; got != want {
+			t.Errorf("%s URL 指纹=%s 内容实算=%s（两者必须一致）", c.name, got, want)
+		}
+	}
+}
+
+// 首屏主题预热脚本：必须能同源取到，且引用的位置早于样式表。
+// 顺序是这个问题唯一的关键——放到 <body> 或 <style> 之后，就会退回到
+// 「刷新先按默认深色画一帧，再翻成用户选的主题」的老毛病（用户可见的闪烁）。
+func TestThemeBootScriptRunsBeforeStyles(t *testing.T) {
+	p := newTestPanel()
+
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, httptest.NewRequest("GET", "/panel/theme.js", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("theme.js code=%d want 200", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); !strings.Contains(ct, "javascript") {
+		t.Errorf("theme.js Content-Type=%q want javascript", ct)
+	}
+	// 键名与 app.js 的 LS_THEME 必须一致，否则预热读不到用户偏好、白闪照旧。
+	if !strings.Contains(rec.Body.String(), "wb2api.theme") {
+		t.Error("theme.js 未读取 wb2api.theme，与 app.js 的存储键对不上")
+	}
+
+	page := httptest.NewRecorder()
+	p.ServeHTTP(page, httptest.NewRequest("GET", "/panel/", nil))
+	body := page.Body.String()
+	iScript := strings.Index(body, `<script src="theme.js?v=`)
+	if iScript < 0 {
+		t.Fatal("index.html 未引用 theme.js")
+	}
+	iStyle := strings.Index(body, "<style>")
+	if iStyle < 0 || iScript > iStyle {
+		t.Errorf("theme.js 必须早于 <style> 加载: script@%d style@%d", iScript, iStyle)
 	}
 }
 

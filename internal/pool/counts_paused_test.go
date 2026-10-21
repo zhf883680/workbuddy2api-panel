@@ -6,56 +6,45 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 )
 
-// TestCountsPausedSeparate 暂停号在两种口径下的计数（issue #125）。
+// 计数口径：paused 单列 vs 并入 disabled——同一份遍历两种口径都要成立。
 //
-// CountsDetailed 把 paused 并入 disabled —— 那是 /status 的「不可用」口径，对监控与
-// 脚本是稳定契约；CountsDetailedWithPaused 则分开返回，供面板回答「禁用几个、
-// 暂停几个」。两个口径必须**同时**成立：只满足一个，另一个就会失真（面板把暂停显示
-// 成"已禁用"，或 /status 少报不可用账号）。
-func TestCountsPausedSeparate(t *testing.T) {
+// 为什么：/status（与 /metrics）的「不可用」= disabled + paused 是监控契约，不能因面板
+// 展示需要而改变；面板概况要分开（禁用几个、暂停几个）。吸收上游 PR #130 的修法后，
+// 共享遍历不再替调用方决定合并与否。
+func TestCountsPausedSplitAndMerged(t *testing.T) {
 	p := New("")
-	p.Add(&auth.Auth{UID: "u1"}) // 健康
-	p.Add(&auth.Auth{UID: "u2"}) // 暂停选号
-	p.Add(&auth.Auth{UID: "u3"}) // 真禁用
-	if !p.Pause("u2") {
-		t.Fatal("Pause 对存在的账号应返回 true")
-	}
-	p.Disable("u3", "手工禁用")
-
-	// --- 合并口径（/status 契约）：暂停计入 disabled ---
-	total, healthy, _, disabled, _ := p.CountsDetailed()
-	if total != 3 {
-		t.Fatalf("total=%d want 3", total)
-	}
-	if healthy != 1 {
-		t.Errorf("healthy=%d want 1（只有 u1 参与选号）", healthy)
-	}
-	if disabled != 2 {
-		t.Errorf("CountsDetailed.disabled=%d want 2（暂停 + 禁用，即 /status 的不可用口径）", disabled)
+	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(&auth.Auth{UID: "u2"})
+	p.Add(&auth.Auth{UID: "u3"})
+	p.Disable("u2", "test disable")
+	if !p.Pause("u3") {
+		t.Fatal("Pause 失败")
 	}
 
-	// --- 分开口径（面板概况）：禁用与暂停各自计数 ---
-	t2, h2, _, dis, pz, _ := p.CountsDetailedWithPaused()
-	if t2 != total || h2 != healthy {
-		t.Errorf("两种口径的 total/healthy 必须一致：WithPaused=(%d,%d) Counts=(%d,%d)",
-			t2, h2, total, healthy)
+	// ① 合并口径（/status、/metrics）：两个都算进 disabled。
+	total, _, _, disabled, _ := p.CountsDetailed()
+	if total != 3 || disabled != 2 {
+		t.Errorf("CountsDetailed: total=%d disabled=%d want 3/2（禁用 + 暂停都算不可用）", total, disabled)
 	}
-	if dis != 1 {
-		t.Errorf("WithPaused.disabled=%d want 1（只有真正禁用的 u3）", dis)
+	// ② 分开口径（面板概况）：禁用 1、暂停 1。
+	_, _, _, d2, pz, _ := p.CountsDetailedWithPaused()
+	if d2 != 1 || pz != 1 {
+		t.Errorf("CountsDetailedWithPaused: disabled=%d paused=%d want 1/1", d2, pz)
 	}
-	if pz != 1 {
-		t.Errorf("WithPaused.paused=%d want 1（只有 u2）", pz)
+	// ③ 按域口径保持合并语义不变。
+	_, _, _, d3, _ := p.CountsDetailedForRealm("cn")
+	if d3 != 2 {
+		t.Errorf("CountsDetailedForRealm: disabled=%d want 2（口径与 CountsDetailed 一致）", d3)
 	}
-	if dis+pz != disabled {
-		t.Errorf("拆分后必须仍能还原合并口径：%d+%d != %d", dis, pz, disabled)
+	// ④ 遍历本身：RealmHealth 里两者互斥、且 healthy/cooling 不受影响。
+	h := p.RealmHealth("")
+	if h.Disabled != 1 || h.Paused != 1 || h.Healthy != 1 {
+		t.Errorf("RealmHealth: disabled=%d paused=%d healthy=%d want 1/1/1", h.Disabled, h.Paused, h.Healthy)
 	}
-
-	// --- 按域分组（/status 的 realm 建模）同样保持合并口径 ---
-	// 空 realm = 不加谓词，因此必须与 CountsDetailed 逐项一致；不能用面板的拆分口径
-	// 顺手改掉它。
-	totR, _, _, disR, _ := p.CountsDetailedForRealm("")
-	if totR != total || disR != disabled {
-		t.Errorf("CountsDetailedForRealm(\"\") 应与 CountsDetailed 同口径：(%d,%d) vs (%d,%d)",
-			totR, disR, total, disabled)
+	// ⑤ 恢复暂停号后回到「可用」，数字逐位回退。
+	p.Resume("u3")
+	_, _, _, d4, pz4, _ := p.CountsDetailedWithPaused()
+	if d4 != 1 || pz4 != 0 {
+		t.Errorf("Resume 后 disabled=%d paused=%d want 1/0", d4, pz4)
 	}
 }

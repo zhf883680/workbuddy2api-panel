@@ -3,6 +3,7 @@
 package pool
 
 import (
+	"log"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -49,14 +50,22 @@ type Pool struct {
 	// 收费与否的判据见 floorBlockedForModel：本地实测台账优先，缺失时用上游目录
 	// 倍率（modelRateOf 注入）兜底，避免「无观测的高价新模型」绕过保底。
 	creditFloor int64
+	// creditFloorMaxRate 保底兜底允许的目录倍率上限（SetCreditFloorMaxRate 注入）。
+	// 语义：账本无观测（tier 1）时，目录倍率 ≤ 该值 → 放行（让便宜的新模型有机会
+	// 跑出第一笔实测入账）；> 该值 → 仍按收费模型拦（保住 kimi-k3-1 那类事故的防护）。
+	// 0 = 严格模式（任何已知正倍率都拦，即 PR #2 之前的现状）；负值非法保留原值。
+	creditFloorMaxRate float64
 	// modelRateOf 按 (realm, 模型) 查上游目录积分倍率（"0.79" / "" = 未知）。
 	// 由 main 用 upstream.Client.ModelRate 注入——pool 不依赖 upstream 包（避免
 	// 循环依赖与分层破坏），nil 时倍率兜底不生效（退化为仅本地台账判定）。
-	// 仅在持 p.mu 时由 floorBlockedForModel 调用；回调不得反向调用 Pool 方法。
+	// 仅在持 p.mu 时由 floorBlockedForRealmModel 调用；回调不得反向调用 Pool 方法。
 	modelRateOf func(realm, model string) string
 	// 加权路由的闲置补偿调优（SetWeights 注入；默认值见 defaultIdle*）。
 	idleWeightPerHour float64
 	idleWeightMax     float64
+	// expiringWindow 快过期窗口（pool.expiring_soon，main 注入）。0 = 未注入 → 紧迫度
+	// 退回旧的固定倍率（见 expiringUrgency）。
+	expiringWindow time.Duration
 	// preferExpiring 最早到期优先路由开关（默认 true）。开启且快过期窗口内存在有效
 	// 批次时，选号在成本层内先按最早到期排序；关闭后只使用普通加权路由。
 	preferExpiring bool
@@ -65,6 +74,20 @@ type Pool struct {
 	// maxInFlightGlobal global 域单账号在途上限分档（WAF 403 修复 P1-1：global 域
 	// WAF 风控更紧，压低并发）；0 = 未设置，回落 maxInFlight（不分档，零回归）。
 	maxInFlightGlobal int
+	// reserveCredits 保留积分阈值（SetReserveCredits 注入；0 = 关闭）。余额已知
+	// （creditsTotal > 0）且 credits <= 阈值 的账号停止接单——仍在池中、照常跑定时
+	// 任务（签到/猫猫旅行本身赚积分），充值后自动恢复。上游余额耗尽会发提醒短信，
+	// 设阈值即避免被用到 0。
+	reserveCredits int64
+	// accountPriority 账号优先级（uid → 正整数，小 = 先消耗；SetAccountPriority 注入）。
+	// issue #62：配了的账号构成「先烧层」——层内有号可用时未配置的号一律不接单，
+	// 等价于「先把这批号的余额烧完，再换下一批」。硬过滤而非排序：排序只改抽签次序，
+	// 做不到「优先消耗某个账号的余额」。缺省 nil = 全部未配置（选号行为与旧版一致）。
+	accountPriority map[string]int
+	// accountShare 账号占比（uid → 相对权重，正数；SetAccountShare 注入）。
+	// issue #62：同一层内配了占比的账号独占抽签，按 share 归一化分流量（70/30 与
+	// 7/3 同义，不必凑满 100）。缺省 nil = 全部未配置（行为与旧版一致）。
+	accountShare map[string]float64
 	// randInt64N 仅供测试注入确定性随机源；nil 时用 math/rand/v2 全局源。
 	// 生产代码不应设置此字段。
 	randInt64N func(n int64) int64
@@ -186,11 +209,51 @@ func (p *Pool) SetWeights(idlePerHour, idleMax float64) {
 	}
 }
 
-// SetPreferExpiring 注入最早到期优先路由开关（main 从 config 解析后调用）。
-func (p *Pool) SetPreferExpiring(enabled bool) {
+// SetReserveCredits 注入「保留积分」阈值（main 从 config 注入；0 = 关闭）。
+// 与 SetCostExploreInterval 同风格：0 是合法值（关闭默认），负值非法保留现值。
+// 不落 state.json——config 是事实源，重启由 main 重新注入。
+func (p *Pool) SetReserveCredits(v int64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if v < 0 {
+		return
+	}
+	p.reserveCredits = v
+}
+
+// SetPreferExpiring 注入最早到期优先路由开关与快过期窗口（main 从 config 解析后调用）。
+// window <= 0 = 未注入 → 紧迫度退回旧的固定倍率（不引入梯度），便于嵌入方/单测保持旧行为。
+func (p *Pool) SetPreferExpiring(enabled bool, window time.Duration) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.preferExpiring = enabled
+	p.expiringWindow = window
+}
+
+// SetAccountPriority 注入账号优先级表（uid → 正整数，小 = 先消耗；issue #62）。
+// nil/空表 = 全部未配置，选号行为与未开此功能完全一致。非正值由 config 校验剔除。
+// 与 SetReserveCredits 同风格：不落 state.json——config 是事实源，重启由 main 重新注入。
+func (p *Pool) SetAccountPriority(m map[string]int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.accountPriority = m
+	// 静默失败是这类配置最坑的形态：uid 打错/字段名写错都不报错，只是"没生效"。
+	// 打一行键数，配合逐号状态里的 priority 字段（面板 /panel/api/accounts）即可
+	// 自证配置被读到且被匹配上。
+	if len(m) > 0 {
+		log.Printf("[pool] account_priority 已配置 %d 个账号（未配置的号在其后消费）", len(m))
+	}
+}
+
+// SetAccountShare 注入账号占比表（uid → 相对权重，正数；issue #62）。
+// nil/空表 = 全部未配置。占比在同一层内生效，先于「最早到期优先」（见 pick）。
+func (p *Pool) SetAccountShare(m map[string]float64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.accountShare = m
+	if len(m) > 0 {
+		log.Printf("[pool] account_share 已配置 %d 个账号（同层内按归一化占比分流）", len(m))
+	}
 }
 
 // SetDegrade 注入连败降权参数（main 从 config 解析后调用，issue #114）。
@@ -229,13 +292,34 @@ func (p *Pool) SetCreditFloor(n int64) {
 
 // SetModelRateOf 注入上游目录积分倍率查表（main 用 upstream.Client.ModelRate 装配）。
 // 供积分保底兜底判定「未实测过的模型是否收费」——本地台账无观测时，不能因为
-// 「没学过」就放行，否则高价新模型会把触底号一次性打穿（kimi-k3-1 实案：
+// 「没学过」就无条件放行，否则高价新模型会把触底号一次性打穿（kimi-k3-1 实案：
 // 全池无观测 → 保底全部放行 → 两笔扣 111 分打穿到 0 并硬冷却到次日 04:00）。
 // fn 可为 nil（清注入）；回调只在持 p.mu 时被调用，不得反向调用 Pool 方法。
 func (p *Pool) SetModelRateOf(fn func(realm, model string) string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.modelRateOf = fn
+}
+
+// SetCreditFloorMaxRate 注入保底兜底允许的目录倍率上限（config pool.credit_floor_max_rate）。
+//
+// 解决两头堵：全额拦（旧行为）会让便宜的新模型在触底号上永远跑不出第一笔账本；
+// 全额放（PR #2）会把 kimi-k3-1 那类高价模型的事故防护一起删掉。按倍率分档后
+// 便宜模型（如 x0.11）能入账，贵的（x1.62）仍拦。0 = 严格模式（等于旧行为）。
+// 负值非法保留原值。
+func (p *Pool) SetCreditFloorMaxRate(v float64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if v >= 0 {
+		p.creditFloorMaxRate = v
+	}
+}
+
+// CreditFloorMaxRate 透出生效的倍率上限（面板/status 用）。0 = 严格模式。
+func (p *Pool) CreditFloorMaxRate() float64 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.creditFloorMaxRate
 }
 
 // SetMaxInFlight 注入单账号最大在途请求数；0 = 不限。负值保留原值。
@@ -356,8 +440,8 @@ func (p *Pool) SyncToDir(auths []*auth.Auth) {
 			changed = true
 		}
 	}
-	if changed {
-		p.saveLocked()
+	if changed && !p.saveLocked() {
+		p.dirty.Store(true) // 剔除结果没落盘：交给 flusher 重试，否则已删账号下次启动复活
 	}
 }
 

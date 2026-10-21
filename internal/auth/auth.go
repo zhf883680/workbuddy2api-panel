@@ -3,12 +3,12 @@
 package auth
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
 	"log"
-	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/safefile"
 )
 
 // Auth 是归一化后的账号凭证（来源可以是插件 OAuth 嵌套形或手写扁平形）。
@@ -209,6 +210,103 @@ func (a *Auth) IsGlobal() bool { return a.Realm() == "global" }
 // 无需加锁——Realm() 加锁是因为 realm/Domain 会被 RefreshToken 在锁内改写。
 func (a *Auth) IsEnterprise() bool { return strings.TrimSpace(a.EnterpriseID) != "" }
 
+// apiTokenPrefixes 静态 API Key 的前缀集合：ck_（CodeBuddy 控制台签发）与
+// pt_（官方 CLI @tencent-ai/codebuddy-code 另有该前缀）。
+//
+// 官方 CLI 的判据是 tokenType === "ApiKey" 且 token 以这两个前缀之一开头；auth
+// 文件不持久化 tokenType（refresh 只认 OAuth 设备流，静态 Key 无法刷新），前缀是
+// 落盘形态里唯一稳定、跨进程一致的判据。
+var apiTokenPrefixes = []string{"ck_", "pt_"}
+
+// isAPIKeyToken 判 token 是否以静态 API Key 前缀开头。
+func isAPIKeyToken(at string) bool {
+	for _, p := range apiTokenPrefixes {
+		if strings.HasPrefix(at, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// isAPIKeyLocked IsAPIKey 的无锁内部实现：仅限**已持 a.mu** 的调用方使用
+// （sync.Mutex 不可重入，锁内再调 AccessTokenValue 会自锁）。
+func (a *Auth) isAPIKeyLocked() bool { return isAPIKeyToken(a.AccessToken) }
+
+// IsAPIKey 报告账号是否为静态 API Key 账号（AccessToken 以 ck_/pt_ 开头）。
+//
+// 静态 Key 直接可用（Authorization: Bearer <key>，官方 CLI 同时发 X-API-Key），
+// 但它**没有**个人账号身份：签到 / 成长任务 / 连登 / 旅行 / 夜猫子一律不适用，
+// 额度只能走企业口径端点（个人 get-user-resource 对静态 Key 返回空 Accounts），
+// 见 UsesEnterpriseBilling。
+//
+// 经 AccessTokenValue() 加锁读取：RefreshToken 会在锁内改写 AccessToken。
+func (a *Auth) IsAPIKey() bool {
+	if a == nil {
+		return false
+	}
+	return isAPIKeyToken(a.AccessTokenValue())
+}
+
+// UsesEnterpriseBilling 报告账号的额度查询是否该走企业口径端点
+// （/v2/billing/meter/get-enterprise-user-usage）。
+//
+// 企业版与静态 API Key 账号同属此列：个人 get-user-resource 对二者均返回空
+// Accounts（企业账号无个人资源包；静态 Key 无个人账号身份），额度必须走企业口径，
+// 否则余额恒为 0 → 积分保底把可用号当成耗尽号挡掉。
+func (a *Auth) UsesEnterpriseBilling() bool { return a.IsEnterprise() || a.IsAPIKey() }
+
+// TokenSource 从 AccessToken 的 JWT payload 里读 token_source 声明（官方客户端用它
+// 填出站 X-Auth-Method 与 X-Userinfo.token_source）。非 JWT / 无该声明 / 解码失败一律
+// 返回空串——空表示「这个账号没有该维度」，调用方随之不发对应头（不伪造）。
+//
+// 每次现解码而不缓存：RefreshToken 会整体换发 token，token_source 可能随重新授权翻转。
+// 成本是一次 base64 + 小 JSON，相对一次上游请求可忽略。
+func (a *Auth) TokenSource() string {
+	if a == nil {
+		return ""
+	}
+	return jwtClaim(a.AccessTokenValue(), "token_source")
+}
+
+// jwtClaim 解出 JWT payload 里的指定字符串声明；非 JWT / 解码失败返回空。
+// 先按无填充 base64url 解（JWT 标准），失败再试带填充形态（兼容非标准签发方）。
+func jwtClaim(token, name string) string {
+	parts := strings.Split(token, ".")
+	if len(parts) < 2 {
+		return ""
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		if raw, err = base64.URLEncoding.DecodeString(parts[1]); err != nil {
+			return ""
+		}
+	}
+	var payload map[string]any
+	if json.Unmarshal(raw, &payload) != nil {
+		return ""
+	}
+	v, _ := payload[name].(string)
+	return strings.TrimSpace(v)
+}
+
+// SupportsPersonalGrowth 报告账号是否具备个人成长体系（签到 / 成长任务 / 连登管家 /
+// 猫猫旅行 / 夜猫子）。企业版与静态 API Key 都没有该体系：
+//   - 企业版：上游一律拒绝（400 code 10001 / 403 growth-only，见 IsEnterprise）；
+//   - 静态 API Key：根本没有个人账号身份。
+//
+// scheduler 各任务与 panel 成长入口统一用本方法门控，避免对注定失败的端点空发请求、
+// 把本可正常对话的号攒出一串上游报错。
+func (a *Auth) SupportsPersonalGrowth() bool { return !a.IsEnterprise() && !a.IsAPIKey() }
+
+// SupportsPersonalEndpoints 报告账号是否可调用「签到 / 任务列表」这类显式报错的个人端点。
+// 与 SupportsPersonalGrowth（执行类门控）刻意分开命名：两者当前的判据相同，但语义不同
+// ——将来若某类账号「读得到、记不上账」，只需改这一处而不影响执行类门控。
+func (a *Auth) SupportsPersonalEndpoints() bool { return !a.IsEnterprise() && !a.IsAPIKey() }
+
+// 不要再用 AccessToken 的 token_source=enterprise_switch 判定「企业上下文」：
+// 实测两个只带该章的**个人版**号（enterpriseId 空）成长任务全部 claimed、行为事件
+// 照常计分——该章只记本次授权走了哪条流程。企业形态一律以 enterpriseId 为准。
+
 // isGlobalDomain 判定 domain 是否指向 www.workbuddy.ai 家族。
 // 同时接受裸域 workbuddy.ai 与任意子域（HasSuffix("www.workbuddy.ai") 或裸域本身）。
 func isGlobalDomain(d string) bool {
@@ -220,6 +318,11 @@ func isGlobalDomain(d string) bool {
 func (a *Auth) NeedsRefresh(within time.Duration) bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	// 静态 API Key 永不刷新（refresh 端点只认 OAuth 设备流）：恒 false，否则请求
+	// 路径会先 refresh、失败后把该号当坏号冷却换号——Key 本身是好的。
+	if a.isAPIKeyLocked() {
+		return false
+	}
 	if a.ExpiresAt <= 0 {
 		return true
 	}
@@ -338,11 +441,12 @@ func (a *Auth) SaveAtomic() error {
 	if err != nil {
 		return err
 	}
-	tmp := a.FilePath + ".tmp"
-	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+	// 落盘走 safefile：tmp fsync 后才 rename（掉电不会留下长度正确、内容全 0 的
+	// 凭证文件），并把上一份有效内容留成 <file>.bak —— LoadDir 读到坏文件时用它。
+	if err := safefile.WriteKeep(a.FilePath, raw, 0o600); err != nil {
 		// Docker bind-mount 权限问题的典型现场：容器内 app 用户（uid 10001）
 		// 对宿主机挂载目录无写权限。给出可操作指引而不是裸 syscall 错误。
-		msg := fmt.Sprintf("写入 %s 失败: %v", tmp, err)
+		msg := fmt.Sprintf("写入 %s 失败: %v", a.FilePath, err)
 		if errors.Is(err, fs.ErrPermission) {
 			msg += "\n（Docker 部署：容器内用户对宿主机挂载目录无写权限。解法任选：" +
 				"1) 以本机 uid 运行容器：PUID=$(id -u) PGID=$(id -g) docker compose up -d；" +
@@ -351,7 +455,26 @@ func (a *Auth) SaveAtomic() error {
 		}
 		return errors.New(msg)
 	}
-	return os.Rename(tmp, a.FilePath)
+	return nil
+}
+
+// SaveAtomicRetry 在 SaveAtomic 基础上做有界重试（0/100ms/300ms）。
+//
+// 为什么需要：refresh 成功后上游已经轮换了 RT，新 token 只在内存里；如果这一次
+// 落盘失败（磁盘瞬时满、bind-mount 抖动），进程重启会拿旧 RT 去刷新——旧 RT 可能
+// 已被消费，账号直接进入「需要重新登录」。重试把瞬时失败挡掉；仍失败由调用方
+// 打 ERR（错误汇总可见），至少不让问题静默。
+func (a *Auth) SaveAtomicRetry() error {
+	var err error
+	for i, delay := range []time.Duration{0, 100 * time.Millisecond, 300 * time.Millisecond} {
+		if i > 0 {
+			time.Sleep(delay)
+		}
+		if err = a.SaveAtomic(); err == nil {
+			return nil
+		}
+	}
+	return err
 }
 
 // LoadDir 扫描并解析 dir 下 workbuddy*.json；解析失败的文件静默跳过（启动日志由调用方统计）。
@@ -368,12 +491,20 @@ func LoadDir(dir string) ([]*Auth, error) {
 	seenUID := make(map[string]string, len(files))
 	var out []*Auth
 	for _, f := range files {
-		raw, err := os.ReadFile(f)
+		// 坏文件不再静默跳过：safefile.Read 在正文损坏时回退到 .bak（掉电留下的
+		// 全 0 文件因此还能救回账号），两边都坏才放弃，并且说清是哪个文件、坏在哪
+		// ——「账号凭空少了一个」比多打一行 ERROR 难查得多。
+		raw, err := safefile.Read(f, func(b []byte) bool {
+			_, perr := Parse(b)
+			return perr == nil
+		})
 		if err != nil {
+			log.Printf("ERROR: auth 文件 %s 无法读取: %v —— 该账号本次不在池里，修好文件或重新登录", f, err)
 			continue
 		}
 		a, err := Parse(raw)
 		if err != nil {
+			log.Printf("ERROR: auth 文件 %s 解析失败: %v —— 该账号本次不在池里", f, err)
 			continue
 		}
 		a.FilePath = f

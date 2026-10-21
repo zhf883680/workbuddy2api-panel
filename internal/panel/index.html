@@ -4,6 +4,11 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>WorkBuddy2API · 控制台</title>
+<!-- 首屏主题预热：必须留在样式表之前、且是同步外链脚本。
+     html 根节点上的 data-theme="dark" 只是无脚本兜底；真实偏好在 localStorage，
+     只有 body 末尾的 app.js 才读它——那样第一帧已经按深色画完了，刷新就会
+     「先闪一下夜间模式」。theme.js 把判定提到样式表解析之前，见文件头注释。 -->
+<script src="theme.js"></script>
 <style>
 /* ── 设计令牌：明暗两套独立色板 ─────────────────────────────────────────
    冷石墨基调（仪表盘语言，非营销页）：底色分层 + 单一靛蓝强调（仅交互），
@@ -94,16 +99,25 @@ body {
 .qgroup header .nm { font-weight: 600; font-size: 13.5px; }
 .qgroup header .cnt { font-size: 12px; color: var(--ink-3); font-variant-numeric: tabular-nums; }
 .qrow {
-  display: grid; grid-template-columns: 118px 1fr 52px 84px minmax(120px, 240px);
+  display: grid; grid-template-columns: minmax(88px, 118px) minmax(0, 1fr) 72px 96px minmax(100px, 240px);
   gap: 10px; align-items: center; padding: 7.5px 16px; font-size: 13px;
 }
 .qrow:hover { background: var(--surface-2); }
 .qrow .code { font: 11.5px/1.35 var(--mono); color: var(--ink-3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .qrow .name { display: flex; align-items: center; gap: 7px; min-width: 0; }
 .qrow .name .t { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.qrow .prog { font-variant-numeric: tabular-nums; color: var(--ink-2); text-align: right; }
+.qrow .prog { min-width: 0; font-variant-numeric: tabular-nums; color: var(--ink-2); text-align: right; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .qrow .st { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
 .qrow .msg { font-size: 12px; color: var(--ink-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.qgroup header button { flex: none; margin-left: auto; align-self: center; }
+@media (max-width: 640px) {
+  .qrow { grid-template-columns: minmax(0, 1fr) auto; grid-template-areas: "name st" "code prog" "msg msg"; gap: 4px 12px; }
+  .qrow .code { grid-area: code; }
+  .qrow .name { grid-area: name; }
+  .qrow .prog { grid-area: prog; }
+  .qrow .st { grid-area: st; }
+  .qrow .msg { grid-area: msg; white-space: normal; overflow-wrap: anywhere; }
+}
 .qdot { width: 7px; height: 7px; border-radius: 50%; flex: none; }
 .qdot.done { background: var(--ok); }
 .qdot.run { background: var(--accent); animation: qpulse 1.2s ease-in-out infinite; }
@@ -112,25 +126,6 @@ body {
 .qdot.skip { background: var(--ink-3); }
 @keyframes qpulse { 50% { opacity: .35; } }
 @media (prefers-reduced-motion: reduce) { .qdot.run { animation: none; } }
-.srow { display: grid; grid-template-columns: minmax(150px, 210px) 1fr auto; gap: 14px; align-items: center; padding: 13px 16px; }
-.srow + .srow { border-top: 1px solid var(--line-soft); }
-.srow .who .nm { font-weight: 600; font-size: 13.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.srow .who .id { font: 10.5px var(--mono); color: var(--ink-3); margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.shead {
-  display: grid; grid-template-columns: minmax(150px, 210px) 1fr auto;
-  gap: 14px; align-items: center; padding: 9px 16px 7px;
-  font-size: 11.5px; color: var(--ink-3); border-bottom: 1px solid var(--line-soft);
-}
-.shead .stasks span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.stasks { display: grid; grid-template-columns: repeat(5, minmax(64px, 1fr)); gap: 6px 10px; }
-.stask { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; color: var(--ink-2); }
-.stask .mark { font-size: 13px; line-height: 1; width: 14px; text-align: center; flex: none; }
-.stask.ok .mark { color: var(--ok); }
-.stask.warn .mark { color: var(--warn); } .stask.warn .fr { color: var(--warn); font-variant-numeric: tabular-nums; }
-.stask.todo { color: var(--ink-3); }
-.srow .luck { display: flex; align-items: center; gap: 5px; font-size: 12.5px; color: var(--ink-2); font-variant-numeric: tabular-nums; white-space: nowrap; }
-.srow .luck svg { width: 14px; height: 14px; opacity: .7; }
-.srow .err { grid-column: 1 / -1; font-size: 12px; color: var(--bad); margin-top: -4px; }
 .pulse { width: 7px; height: 7px; border-radius: 50%; background: var(--ok); flex: none; }
 .pulse.bad { background: var(--bad); }
 .pulse.warn { background: var(--warn); }
@@ -144,7 +139,9 @@ body {
 .topbar .sep { color: var(--ink-3); }
 .topbar .meta { color: var(--ink-3); font-size: 12px; font-family: var(--mono); }
 .topbar .grow { flex: 1; }
-.view { padding: 22px 24px 60px; max-width: 1560px; margin: 0 auto; width: 100%; }
+/* 视图铺满可用宽度：此前 max-width:1180px 在 1920 屏上右侧留 ~530px 空白。
+   .main 是 flex 列，子项默认 stretch，去掉上限即自适应。 */
+.view { padding: 22px 24px 60px; width: 100%; }
 .view[hidden] { display: none; }
 
 /* ── 控件 ─────────────────────────────────────────────────────────── */
@@ -160,11 +157,9 @@ button.primary:hover:not(:disabled) { filter: brightness(1.08); }
 button.ghost { background: transparent; }
 button.danger { color: var(--bad); }
 button.danger:hover:not(:disabled) { border-color: var(--bad); }
-button.xs { padding: 3.5px 9px; font-size: 12.5px; border-radius: 6px; white-space: nowrap; }
-/* select.xs：header 里的紧凑选择框。通用 input/select 规则是 width:100%（表单页用），
-   header 里若不收窄会把同行 note 挤到换行——收成内容宽并压小外观，与 button.xs 同款。 */
-select.xs { width: auto; padding: 3.5px 9px; font-size: 12.5px; border-radius: 6px; }
-button.icon { padding: 7px 9px; }
+button.xs { padding: 3.5px 9px; font-size: 12.5px; border-radius: 6px; }
+/* 图标按钮：flex 居中。默认 inline-block 时 SVG 坐在文字基线上，行盒的下沉空间全落在图标下方（实测上 8 / 下 14.7）。 */
+button.icon { padding: 7px 9px; display: inline-flex; align-items: center; justify-content: center; }
 input, select {
   font: inherit; color: var(--ink); background: var(--surface-2);
   border: 1px solid var(--line); border-radius: 7px; padding: 7px 11px; width: 100%;
@@ -197,7 +192,7 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
 .box > header h3 { font-size: 13.5px; font-weight: 600; }
 .box > header h3 .hint { font-size: 11.5px; font-weight: 400; color: var(--ink-3); margin-left: 6px; }
 .box > header .grow { flex: 1; }
-.box > header .note { color: var(--ink-3); font-size: 12px; white-space: nowrap; }
+.box > header .note { color: var(--ink-3); font-size: 12px; }
 /* 面板块头部的下拉/输入按内容取宽：全局 input/select 是 width:100%（配置表单要整行），
    在 header 里会把标题挤成两行、把"近 3 天"这类短选项拉成一整条。 */
 .box > header select, .box > header input { width: auto; }
@@ -236,6 +231,8 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
 #taskTable .who .nm, #taskTable .who .id { white-space: normal; word-break: break-all; }
 .who .nm { font-weight: 550; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .who .id { font-family: var(--mono); font-size: 11.5px; color: var(--ink-3); margin-top: 1px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.acc.md .who .nm { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.acc.md .who .nm .mid { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .realm-tag { display: inline-block; margin-left: 6px; padding: 1px 5px; border-radius: 4px; font: 500 10px/1 var(--sans); color: var(--accent); background: var(--accent-soft); border: 1px solid color-mix(in srgb, var(--accent) 22%, transparent); vertical-align: 1px; }
 .realm-row { display: flex; align-items: center; gap: 14px; padding: 4px 0 10px; }
 .realm-opt { display: inline-flex; align-items: center; gap: 5px; font-size: 12.5px; color: var(--ink-2); cursor: pointer; }
@@ -271,16 +268,11 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
   display: inline-flex; align-items: center; gap: 5px; padding: 1px 9px;
   border-radius: 999px; font-size: 11.5px; font-weight: 500; white-space: nowrap;
 }
-/* 语义文本色工具类：表格单元格与弹窗提示直接裸用（此前 .good/.bad/.muted
-   只有 .tag/.stat 等前缀形态，裸用没有颜色——密钥页的「启用中 / 已禁用」就是裸用的）。 */
-.good { color: var(--ok); }
-.warn { color: var(--warn); }
-.bad { color: var(--bad); }
-.muted { color: var(--ink-3); }
 .tag.ok { background: var(--ok-soft); color: var(--ok); }
 .tag.warn { background: var(--warn-soft); color: var(--warn); }
 .tag.bad { background: var(--bad-soft); color: var(--bad); }
 .tag.mute { background: var(--surface-2); color: var(--ink-3); border: 1px solid var(--line); }
+.md-avail { flex: none; padding: 0 6px; font-size: 10.5px; line-height: 16px; }
 .rate-limits { display: flex; flex-direction: column; gap: 4px; margin-top: 6px; min-width: 210px; }
 .rate-limit {
   display: flex; align-items: baseline; gap: 6px; padding: 4px 7px;
@@ -343,31 +335,6 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 .dlg .tabs { display: inline-flex; gap: 2px; background: var(--surface-2); border-radius: 9px; padding: 3px; margin-left: 10px; vertical-align: middle; }
 .dlg .tabs .tab { padding: 4px 14px; border-radius: 7px; border: none; background: transparent; color: var(--ink-3); font: 550 12.5px var(--sans); cursor: pointer; }
 .dlg .tabs .tab.on { background: var(--surface); color: var(--ink); box-shadow: 0 1px 3px rgba(0,0,0,.25); }
-/* 原生日期控件的弹层要跟随明暗主题，否则深色下弹出一块刺眼的白。 */
-.dlg input[type=datetime-local] { color-scheme: light; font-family: var(--mono); font-size: 13px; }
-[data-theme="dark"] .dlg input[type=datetime-local] { color-scheme: dark; }
-
-/* ── 分发密钥弹窗：绑定账号勾选区 ───────────────────────────────────
-   列表限高滚动（账号多时弹窗不跟着变长、不会把底部按钮顶出屏幕）、
-   行内是「昵称 + uid8 + 状态/域标签」，选中行整行高亮 + 勾选态高亮。 */
-/* 密钥页底部操作条：主操作（新建密钥）放在列表末尾——列表长了不用回到页面顶部，
-   与表头右侧只读的「刷新」形成"读在上、写在下"的分工。 */
-.kfoot { display: flex; align-items: center; gap: 10px; margin-top: 14px; }
-.kfoot .grow { flex: 1; }
-.kfoot .note { color: var(--ink-3); font-size: 12px; }
-
-.khead { display: flex; align-items: center; gap: 8px; margin: 0 0 7px; }
-.khead .lb { font-size: 12.5px; color: var(--ink-2); }
-.khead .grow { flex: 1; }
-.khead .note { color: var(--ink-3); font-size: 12px; font-variant-numeric: tabular-nums; white-space: nowrap; }
-.keyuids { display: grid; gap: 2px; max-height: 226px; overflow: auto; padding: 6px; background: var(--surface-2); border: 1px solid var(--line-soft); border-radius: 10px; }
-.keyuids label { display: flex; align-items: center; gap: 9px; padding: 7px 9px; border-radius: 7px; font-size: 12.5px; cursor: pointer; }
-.keyuids label:hover { background: var(--raise); }
-.keyuids label.on { background: var(--accent-soft); }
-.keyuids .ku-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.keyuids .ku-uid { flex: none; font: 11px var(--mono); color: var(--ink-3); }
-.keyuids .ku-realm { margin-left: auto; flex: none; }
-.keyuids .empty { padding: 10px; color: var(--ink-3); font-size: 12.5px; }
 .tab-panel + .tab-panel { border-top: 1px solid var(--line-soft); margin: 0 -20px; padding: 14px 20px 0; }
 .url {
   background: var(--surface-2); border: 1px solid var(--line); border-radius: 8px;
@@ -412,10 +379,53 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 }
 .tst.ok { border-left-color: var(--ok); } .tst.err { border-left-color: var(--bad); }
 
+/* 手机版（≤760px）：导航 = 左侧抽屉（桌面隐藏） */
+#btnNav { display: none; }
+.nav-scrim { display: none; }
 @media (max-width: 760px) {
   .shell { grid-template-columns: 1fr; }
-  .nav { position: static; height: auto; flex-direction: row; align-items: center; overflow-x: auto; }
-  .nav ul { display: flex; padding: 8px; } .nav .sig { border: none; }
+  /* 导航：左侧模态抽屉（默认收纳、滑出式） */
+  #btnNav { display: inline-flex; align-items: center; justify-content: center; }
+  .nav-scrim { display: block; position: fixed; inset: 0; background: rgba(6,8,13,.62); opacity: 0; pointer-events: none; transition: opacity .25s; z-index: 65; }
+  .nav-scrim.on { opacity: 1; pointer-events: auto; }
+  .nav {
+    position: fixed; left: 0; top: 0; bottom: 0; height: auto; z-index: 70;
+    width: min(300px, 84vw); min-width: 0; border-right: none;
+    transform: translateX(-105%); visibility: hidden;
+    transition: transform .25s ease-out, visibility .25s;
+    box-shadow: 0 4px 32px rgba(0,0,0,.45);
+  }
+  .nav.open { transform: none; visibility: visible; }
+  .nav ul { overflow-y: auto; min-height: 0; }
+  .nav a { white-space: nowrap; }
+  .nav .sig .row { white-space: nowrap; }
+  body.nav-open { overflow: hidden; }
+  /* 顶栏：允许换行，控件不竖排；右上三钮已图标化，间距收窄 */
+  .topbar { flex-wrap: wrap; gap: 8px 8px; padding: 10px 12px; }
+  .topbar button { padding: 7px 9px; }
+  .topbar h2, .topbar .sep, .topbar .meta { white-space: nowrap; }
+  .topbar .grow { display: none; }
+  .view { padding: 14px 12px 60px; }
+  /* 表格：整表横向滑动（保持桌面列布局，不被压扁） */
+  table.acc { display: block; overflow-x: auto; white-space: nowrap; }
+  /* 分类条 / 选项 chips：横向滑动 */
+  .chips { display: flex; min-width: 0; overflow-x: auto; padding-bottom: 2px; }
+  .chips .chip { flex: none; }
+  /* 触控：按钮放大；输入 16px 防 iOS 聚焦自动放大 */
+  button.xs { padding: 6px 12px; }
+  .chips .chip { padding: 5px 12px; }
+  input, select, textarea { font-size: 16px; }
+  /* 弹窗：底部抽屉式（!important 压过内联 width） */
+  .veil.on { align-items: flex-end; padding: 0; }
+  .dlg { width: 100% !important; max-width: 100% !important; max-height: 92vh; border-radius: 16px 16px 0 0; }
+  /* 详情类弹窗表格：长值折行而不是横向溢出 */
+  .dlg table.acc { white-space: normal; }
+  .dlg table.acc td { word-break: break-word; }
+  /* Toast：全宽 */
+  #toasts { left: 12px; right: 12px; bottom: 14px; align-items: stretch; }
+  .tst { max-width: none; }
+  /* 卡片头允许换行（计数等不被挤成竖排） */
+  .box header { flex-wrap: wrap; row-gap: 6px; }
   .stat { border-right: none; border-bottom: 1px solid var(--line-soft); }
 }
   /* ── 用量视图 ─────────────────────────────────────────────────────
@@ -465,7 +475,12 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
   .uschart-hd .sw { width: 9px; height: 9px; border-radius: 2px; display: inline-block; }
   .uschart-hd .sw-p { background: var(--accent); }
   .uschart-hd .sw-c { background: var(--ok); }
-  .uschart-hd .sw-t { background: var(--warn); }
+  .uschart-hd .sw-hit { background: var(--warn); }
+  /* 均值是虚线参考线：色块用同色虚纹，和实线的「缓存命中率」一眼可分。 */
+  .uschart-hd .sw-t { background: repeating-linear-gradient(90deg, var(--warn) 0 4px, transparent 4px 6px); }
+  /* 缓存命中率曲线（右轴 0-100%）：折线 + 每个数据点一个圆点。 */
+  .uschart-body .hitline { fill: none; stroke: var(--warn); stroke-width: 1.6; }
+  .uschart-body .hitdot { fill: var(--warn); }
   .uschart-body { padding: 8px 10px 4px; }
   .uschart-body svg { display: block; width: 100%; height: auto; }
   .uschart-body .ax { stroke: var(--line); stroke-width: 1; }
@@ -506,12 +521,6 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
     font-size: 11px; color: var(--ink-3); }
   .pk-legend span { display: flex; align-items: center; gap: 5px; }
   .pk-legend i { width: 9px; height: 9px; border-radius: 2px; display: inline-block; }
-  .pk-group-summary td { padding: 7px 11px; background: var(--surface-2); }
-  .pk-group-toggle { width: 100%; padding: 4px 0; border: 0; background: transparent;
-    color: var(--ink-2); text-align: left; }
-  .pk-group-toggle:hover:not(:disabled) { border: 0; color: var(--accent); }
-  .pk-hidden-row[hidden] { display: none; }
-  .pk-hidden-row td { color: var(--ink-3); }
   .pk-expiry-chart { max-height: 260px; overflow-y: auto; overflow-x: hidden;
     scrollbar-gutter: stable; scrollbar-width: thin; padding-right: 10px;
     overscroll-behavior: contain; }
@@ -536,9 +545,12 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
   .pk-expiry-foot { margin-top: 9px; padding-top: 8px; border-top: 1px solid var(--line-soft);
     color: var(--ink-3); font-size: 11px; }
   .pk-expiry-empty { padding: 22px 0; text-align: center; color: var(--ink-3); font-size: 12px; }
-  .pk-card .expirybar { display: flex; height: 5px; border-radius: 3px; overflow: hidden;
-    margin-top: 6px; background: var(--surface-2); }
-  .pk-card .expirybar i { display: block; height: 100%; min-width: 2px; }
+  .pk-group-summary td { padding: 7px 11px; background: var(--surface-2); }
+  .pk-group-toggle { width: 100%; padding: 4px 0; border: 0; background: transparent;
+    color: var(--ink-2); text-align: left; }
+  .pk-group-toggle:hover:not(:disabled) { border: 0; color: var(--accent); }
+  .pk-hidden-row[hidden] { display: none; }
+  .pk-hidden-row td { color: var(--ink-3); }
 
   /* ── 筛选栏（模型档位 / 运行日志 / 用量共用）─────────────────────────
      面板控件默认 input/select 是 width:100%（配置表单要整行），筛选栏里必须显式
@@ -590,6 +602,11 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
   .vtabs .cnt { color: var(--ink-3); font-weight: 400; margin-left: 4px; font-variant-numeric: tabular-nums; }
   .vtabs button.on .cnt { color: var(--ink-2); }
 
+  /* ── 分发密钥（绑定账号勾选区）──────────────────────────────────── */
+  .keyuids { display: grid; gap: 4px; max-height: 240px; overflow: auto; padding: 8px 10px; background: var(--surface-2); border-radius: 8px; }
+  .keyuids label { display: flex; align-items: center; gap: 8px; font-size: 12.5px; }
+  .keyuids .note { margin-left: auto; }
+
   /* ── 请求记录表（运行日志）────────────────────────────────────────── */
   .acc.req { min-width: 1080px; }
   .acc.req th, .acc.req td { padding: 8px 10px; }
@@ -602,20 +619,23 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
   .clip.ip { max-width: 150px; font-family: var(--mono); font-size: 12.5px; }
   .clip.rid { max-width: 150px; font-family: var(--mono); font-size: 11.5px; color: var(--ink-3); }
   .acc.req .muted { color: var(--ink-3); }
+  /* 错误汇总：严重度着色（bad 需处理 / warn 需留意），与日志行同色系 */
+  .acc.req tr.lv-e td { color: var(--bad); }
+  .acc.req tr.lv-w td { color: var(--warn); }
+  .acc.req td.sample { max-width: 380px; overflow: hidden; text-overflow: ellipsis; }
   .src-off { color: var(--warn); }
 
   /* 用量统计条已改用 .kpis（见「用量视图」段），此处不再保留 .stats.compact 变体。 */
 
-  /* 到期提醒卡片（首页）：每账号一行，色点=危险度，正文数字用 mono 对齐。 */
-  .exp-row { display: flex; align-items: flex-start; gap: 10px; padding: 8px 0;
-    font-size: 12.5px; }
-  .exp-row + .exp-row { border-top: 1px solid var(--line-soft); }
-  .exp-dot { width: 9px; height: 9px; border-radius: 50%; margin-top: 4px; flex: none; }
-  .exp-nm { font-weight: 600; flex: none; min-width: 9em; }
-  .exp-main { color: var(--ink-2, inherit); }
-  .exp-main b { font-family: var(--mono); font-variant-numeric: tabular-nums; }
-  .exp-main .note { margin-top: 2px; font-size: 11px; color: var(--ink-3); }
-  .exp-main.err { color: var(--bad); }
+  /* ── 账号备注（本机 localStorage，不写服务器）─────────────────────
+     有备注时备注当主标识，原昵称 / uid8 以 .rm-ghost 浅色跟随。账号池、用量明细、
+     积分扣除三张表共用同一套渲染，保证同一账号在两个视图里显示一致。 */
+  .rm-ghost { color: var(--ink-3); font-weight: 400; margin-left: .35em; }
+  .rm-list { display: flex; flex-direction: column; gap: 9px; }
+  .rm-row { display: flex; align-items: center; gap: 10px; }
+  .rm-row .rm-who { flex: 0 0 168px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    color: var(--ink-2); font-size: 12.5px; }
+  .rm-row input { flex: 1; }
 
 </style>
 </head>
@@ -657,9 +677,13 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       <div class="row" style="margin-top:5px"><span id="navVer">v-</span> · <span id="navRedis">-</span></div>
     </div>
   </nav>
+  <div class="nav-scrim" id="navScrim"></div>
 
   <div class="main">
     <div class="topbar">
+      <button class="icon ghost" id="btnNav" title="导航" aria-label="打开导航" aria-expanded="false">
+        <svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2.5 4.5h11M2.5 8h11M2.5 11.5h11"/></svg>
+      </button>
       <h2 id="ttl">账号池</h2>
       <span class="sep">/</span>
       <span class="meta" id="subMeta">-</span>
@@ -667,8 +691,15 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       <button class="icon ghost" id="btnTheme" title="切换明暗（跟随系统 → 浅色 → 深色）" aria-label="切换主题">
         <svg id="icoTheme" viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M13.2 9.6A5.6 5.6 0 0 1 6.4 2.8a5.6 5.6 0 1 0 6.8 6.8z"/></svg>
       </button>
-      <button id="btnRefresh">刷新</button>
-      <button class="primary" id="btnAdd">添加账号</button>
+      <button class="icon ghost" id="btnRefresh" title="刷新" aria-label="刷新">
+        <svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9M13.5 1.5v3h-3"/></svg>
+      </button>
+      <button class="icon ghost" id="btnLogout" title="登出（清空本机密钥）" aria-label="登出">
+        <svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M6.5 2.5h-3a1 1 0 0 0-1 1v9a1 1 0 0 0 1 1h3M10 5l3 3-3 3M13 8H6"/></svg>
+      </button>
+      <button class="icon primary" id="btnAdd" title="添加账号" aria-label="添加账号">
+        <svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M8 3.5v9M3.5 8h9"/></svg>
+      </button>
     </div>
 
     <!-- 账号池 -->
@@ -677,20 +708,30 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <div class="stat"><div class="v" id="sTotal">-</div><div class="k">账号总数</div></div>
         <div class="stat good"><div class="v" id="sHealthy">-</div><div class="k">可用</div></div>
         <div class="stat warn"><div class="v" id="sCooling">-</div><div class="k">冷却中</div></div>
-        <div class="stat bad"><div class="v" id="sDisabled">-</div><div class="k">已禁用</div></div>
         <div class="stat warn"><div class="v" id="sPaused">-</div><div class="k">已暂停选号</div></div>
+        <div class="stat bad"><div class="v" id="sDisabled">-</div><div class="k">已禁用</div></div>
         <div class="stat"><div class="v" id="sCredits">-</div><div class="k">积分剩余 / 总额</div></div>
         <div class="stat"><div class="v" id="sSticky">-</div><div class="k">粘性会话</div></div>
       </div>
 
-      <div class="box" id="expBox" hidden>
+      <!-- 到期提醒：数据取 /overview 的 credits_expiry_buckets（签到与余额后台刷新
+           按自然日聚合后写入 state.json），打开页面零上游请求。同日多个包合并为一行，
+           后续批次在日期下方列出；完整逐包明细在「积分构成」页。 -->
+      <div class="box">
         <header>
-          <h3>积分到期提醒<span class="hint">按最近到期批次估算 · 日均需耗 = 批次剩余 ÷ 距到期天数 · 上游按失效时刻先后自动优先扣减（FEFO）</span></h3>
+          <h3>积分到期提醒 <span class="hint">按自然日聚合 · 日均需耗 = 该日到期积分 ÷ 距到期天数 · 上游按失效时刻先后自动优先扣减（FEFO）</span></h3>
           <span class="grow"></span>
           <span class="note" id="expNote"></span>
-          <button class="xs" id="btnExp">检查</button>
         </header>
-        <div class="pad"><div id="expList"></div></div>
+        <div class="tbl-wrap">
+        <table class="acc">
+          <thead><tr>
+            <th>账号</th><th>最近到期</th><th class="num">距到期</th>
+            <th class="num">该日到期</th><th class="num">日均需耗</th>
+          </tr></thead>
+          <tbody id="expBody"></tbody>
+        </table>
+        </div>
       </div>
 
       <div class="box">
@@ -698,6 +739,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <h3>账号池</h3>
           <span class="grow"></span>
           <span class="note" id="accNote"></span>
+          <button class="xs" id="btnRemarks">备注</button>
           <button class="xs" id="btnCheckinAll">全部签到</button>
           <button class="xs" id="btnTravelAll">旅行巡检</button>
           <button class="xs" id="btnActivityAll">活跃上报</button>
@@ -715,6 +757,8 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         </div>
       </div>
 
+      <!-- 模型锁池：账号池回答「哪些号不能用」，这张表回答「哪些模型不能用、还要锁多久」。
+           数据来自 /panel/api/overview 的 model_locks（与 /status 同源，无锁时为 null）。 -->
       <div class="box">
         <header>
           <h3>模型锁池 <span class="hint">哪些模型不能用、还要锁多久</span></h3>
@@ -733,19 +777,22 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       </div>
     </section>
 
-    <!-- 任务中心 -->
+    <!-- 任务中心：后台自动任务的进展与待办扫描/队列共用一张卡、一个列表
+         （两者都是"某账号的任务进展"，只是来源不同：常驻 jobs vs 一次性队列） -->
     <section class="view" id="view-taskscenter" hidden>
       <div class="box">
         <header>
-          <h3>成长任务队列 <span class="hint" id="qcSummary"></span></h3>
+          <h3>成长任务 <span class="hint" id="tcSummary"></span></h3>
           <span class="grow"></span>
-          <button class="xs" id="btnSchoolVouchers" title="开学季抽奖抽中的第三方券码（活动已结束，历史券码仍可查）">查询券码</button>
           <label class="sel-note">并发
             <select id="qcConc"><option value="1" selected>1</option><option value="2">2</option><option value="3">3</option></select>
           </label>
+          <button class="xs" id="btnSchoolVouchers" title="开学季抽奖抽中的第三方券码（活动已结束，历史券码仍可查）">查询券码</button>
           <button class="xs" id="btnScanAll">扫描待办</button>
+          <button class="xs" id="btnTaskJobsReload">刷新进度</button>
           <button class="xs primary" id="btnRunQueue">执行全部待办</button>
         </header>
+        <div class="state" id="taskJobsNote">新增国区账号后自动执行，每日按成长任务排程继续推进；可在账号任务中手动启动。</div>
         <div class="qprog" id="qProg" hidden>
           <div class="qbar"><i id="qBarFill"></i></div>
           <span class="note" id="qProgText"></span>
@@ -757,9 +804,31 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
             <circle cx="35" cy="33" r="8"/><path d="m40 38 5 5"/>
           </svg>
           <div class="t">还没有扫描过</div>
-          <div class="d">扫描所有账号的成长任务与开学季待办，把没做的排成一列，一键执行。</div>
+          <div class="d">扫描所有账号没做完的成长任务，排成一列，一键执行。</div>
         </div>
         <div id="qcList"></div>
+      </div>
+
+      <!-- 官方补偿：带截止日的限时活动，与成长任务同属「今天要不要动手」的事，故放任务中心。
+           取数只在进入本视图 / 点「检查」 / 点领取时发生（补偿状态没有 overview 快照可吃，
+           挂进 5s 刷新就是每 5 秒打上游），倒计时走动由前端对缓存做本地重渲染。 -->
+      <div class="box">
+        <header>
+          <h3>官方补偿 <span class="hint">先查状态再领 · 无待领不发领取请求</span></h3>
+          <span class="grow"></span>
+          <span class="note" id="compNote"></span>
+          <button class="xs" id="btnCompRefresh">检查</button>
+          <button class="xs primary" id="btnCompAll">全部领取</button>
+        </header>
+        <div class="tbl-wrap">
+        <table class="acc">
+          <thead><tr>
+            <th>账号</th><th>状态</th><th class="num">可领</th>
+            <th class="num">距截止</th><th class="c-acts"></th>
+          </tr></thead>
+          <tbody id="compBody"></tbody>
+        </table>
+        </div>
       </div>
     </section>
 
@@ -838,10 +907,6 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <h3>账号对比</h3>
           <span class="grow"></span>
           <span class="note" id="pkNote">—</span>
-          <select id="pkSort" class="xs" title="逐包明细的排序规则">
-            <option value="end_asc" selected>按到期时间</option>
-            <option value="size_desc">按面额大小</option>
-          </select>
           <button class="xs" id="btnPk">刷新</button>
         </header>
         <div class="pad"><div class="pk-grid" id="pkSummary"></div></div>
@@ -858,6 +923,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <span class="grow"></span>
           <span class="note" id="keysNote">—</span>
           <button class="xs" id="btnKeysRefresh">刷新</button>
+          <button class="primary xs" id="btnKeyCreate">新建密钥</button>
         </header>
         <div class="pad">
           <p class="note" id="keysHint">
@@ -873,11 +939,6 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
               </tr></thead>
               <tbody id="keysBody"></tbody>
             </table>
-          </div>
-          <div class="kfoot">
-            <span class="note">密钥明文只在创建 / 重置时显示一次</span>
-            <span class="grow"></span>
-            <button class="primary" id="btnKeyCreate">新建密钥</button>
           </div>
         </div>
       </div>
@@ -899,13 +960,25 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
               <span class="lb">Token 时序</span>
               <span class="note" id="usChartNote">—</span>
               <span class="grow"></span>
-              <span class="legend">
-                <i class="sw sw-p"></i>prompt<i class="sw sw-c"></i>completion
-                <span class="sep"></span><i class="sw sw-t"></i>均值
-              </span>
+              <span class="legend"><i class="sw sw-p"></i>prompt<i class="sw sw-c"></i>completion<span class="sep"></span><i class="sw sw-hit"></i>缓存命中率<i class="sw sw-t"></i>均值</span>
             </div>
             <div id="usChart" class="uschart-body"></div>
           </div>
+        </div>
+      </div>
+
+      <div class="box">
+        <header><h3>积分与 token 按小时</h3><span class="grow"></span>
+          <span class="note">积分取上游 usage.credit（没观测到的请求不计）；兑换率 = token ÷ 积分</span></header>
+        <div class="tbl-wrap">
+          <table class="acc">
+            <thead><tr>
+              <th class="mark" aria-hidden="true"></th><th>时段</th>
+              <th class="num">请求</th><th class="num">Prompt</th><th class="num">Completion</th>
+              <th class="num">合计</th><th class="num">积分</th><th class="num">token/积分</th>
+            </tr></thead>
+            <tbody id="usHourBody"></tbody>
+          </table>
         </div>
       </div>
 
@@ -993,7 +1066,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
                 <input name="login_lockout_duration" placeholder="10m">
                 <span class="hint">锁定期内一律 429，到期自动解锁</span></label>
             </div>
-            <div class="hint">鉴权失败按来源 IP（代理后取 <code>X-Forwarded-For</code> 首段）累计：覆盖面板密钥门、<code>/status</code> 与 <code>/v1</code> —— 它们共用同一个 api_key。锁定期内正确密钥同样被拒（针对来源的硬锁），状态在内存中，重启进程即清空（误锁的兜底解锁手段）。</div>
+            <div class="hint">鉴权失败按来源 IP（代理后取 <code>X-Forwarded-For</code> 首段）累计：覆盖面板密钥门、<code>/status</code> 与 <code>/v1</code>。锁定期内正确密钥同样被拒，状态在内存中，重启进程即清空。</div>
           </div>
         </div>
 
@@ -1033,6 +1106,26 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
             </div>
             <div class="hr"></div>
             <div class="grid2">
+              <div>
+                <div class="switch"><span class="lb">成长任务队列</span>
+                  <input type="checkbox" name="growth_enabled"></div>
+                <label class="fld"><span class="lb">执行时点（小时，逗号分隔）</span>
+                  <input name="growth_hours" placeholder="11">
+                  <span class="hint">开关同时控制新增国区账号和每日后台执行。每日到点推进未完成项，建议设在零点后。</span></label>
+                <label class="fld"><span class="lb">账号间并发</span>
+                  <input name="growth_concurrency" type="number" min="1" max="4" placeholder="1">
+                  <span class="hint">1-4；调高更快，上游风控暴露面更大</span></label>
+              </div>
+              <div>
+                <div class="switch"><span class="lb">夜猫子</span>
+                  <input type="checkbox" name="blackcat_enabled"></div>
+                <label class="fld"><span class="lb">补足时点（小时，逗号分隔）</span>
+                  <input name="blackcat_hours" placeholder="23">
+                  <span class="hint">只在 23:00–08:00 计数窗口内生效，窗口外自动跳过</span></label>
+              </div>
+            </div>
+            <div class="hr"></div>
+            <div class="grid2">
               <div class="switch"><span class="lb">后台刷新余额</span>
                 <input type="checkbox" name="balance_refresh_enabled"></div>
               <label class="fld"><span class="lb">刷新间隔（分钟）</span>
@@ -1040,11 +1133,10 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
             </div>
             <div class="hr"></div>
             <div class="grid2">
-              <div class="switch"><span class="lb">成长任务自动执行</span>
-                <input type="checkbox" name="growth_enabled" checked></div>
-              <label class="fld"><span class="lb">执行时点（小时，逗号分隔）</span>
-                <input name="growth_hours" placeholder="1">
-                <span class="hint">每日到点自动「扫描 + 执行全部待办」（Sequential 任务链零点解锁后自动推进，建议零点后）</span></label>
+              <div class="switch"><span class="lb">补领清扫（达标未领自动补领）</span>
+                <input type="checkbox" name="task_sweep_enabled"></div>
+              <label class="fld"><span class="lb">清扫间隔（分钟）</span>
+                <input name="task_sweep_minutes" type="number" min="1" placeholder="15"></label>
             </div>
             <div class="hr"></div>
             <div class="switch"><span class="lb">保号任务覆盖已禁用账号</span>
@@ -1098,12 +1190,18 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
               <label class="fld"><span class="lb">积分保底</span>
                 <input name="credit_floor" type="number" min="0" placeholder="100">
                 <span class="hint">余额低于此值不再接实测收费模型（保住免费模型可用）；0 关闭</span></label>
+              <label class="fld"><span class="lb">保底倍率上限</span>
+                <input name="credit_floor_max_rate" type="number" min="0" step="0.01" placeholder="0">
+                <span class="hint">无实测账本时，目录倍率 ≤ 此值才放行（让便宜新模型跑出第一笔账本）；0 = 任何已知收费倍率都拦</span></label>
               <label class="fld"><span class="lb">快过期路由窗口</span>
                 <input name="expiring_soon" placeholder="168h">
                 <span class="hint">窗口内有快过期批次的账号选号权重 ×3（不排序、与金额无关）；0 关闭</span></label>
               <label class="fld"><span class="lb">会话粘性 TTL</span>
                 <input name="ttl" placeholder="30m">
                 <span class="hint">改动需重启进程</span></label>
+              <label class="fld"><span class="lb">保留积分</span>
+                <input name="reserve_credits" type="number" min="0" placeholder="10">
+                <span class="hint">余额低于该值的账号停止接单（0 = 关闭，缺省 10）</span></label>
             </div>
             <div class="switch"><span class="lb">快过期积分优先</span>
               <input type="checkbox" name="prefer_expiring"></div>
@@ -1130,6 +1228,16 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
                 <input name="user_agent" placeholder="留空 = CLI/2.63.2 CodeBuddy/2.63.2">
                 <span class="hint">影响官网积分记录「使用端」显示；需重启</span></label>
             </div>
+            <div class="hr"></div>
+            <div class="grid2">
+              <label class="fld"><span class="lb">模型黑名单</span>
+                <input name="models_hidden" placeholder="deepseek-pro, cn:legacy-model">
+                <span class="hint">逗号分隔；裸名隐藏两域，cn: / global: 只隐藏该域；/v1/models 不列且点名调用直接拒绝，保存即热生效</span></label>
+              <label class="fld"><span class="lb">模型映射</span>
+                <input name="models_aliases" placeholder="claude-opus-4=glm-5.2, gpt-5=global:gpt-5.4">
+                <span class="hint">逗号分隔的「客户端名=真实模型名」；真实名可带 cn:/global: 前缀跨域指向；响应回显客户端原发名；目标仍受黑名单约束，保存即热生效</span></label>
+            </div>
+
             <div class="hr"></div>
             <div class="grid2">
               <label class="fld"><span class="lb">系统提示词模式</span>
@@ -1178,9 +1286,12 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <header>
           <h3>请求记录 <span class="hint">调用来源：IP 取 X-Forwarded-For 首段，无代理头时回落 TCP 对端</span></h3>
           <span class="grow"></span>
-          <span class="note" id="reqSummary">—</span>
           <span class="note" id="reqNote">—</span>
         </header>
+        <!-- reqStats：指标行容器（renderRequestMetrics 写入）。合并 #87 时新排版丢了它，
+             而 loadLogs 里的 renderRequestMetrics 仍写这个 id —— 元素缺失时抛错被
+             loadLogs 的 try/catch 吞掉，整块运行日志渲染不出来（只有它这一个 id 悬空）。 -->
+        <div class="stats" id="reqStats"></div>
         <div class="fbar" id="reqFilter">
           <input id="reqQ" type="search" placeholder="搜索 IP / UA / 模型 / 账号 / 密钥 / 请求 ID" aria-label="搜索请求记录">
           <select id="reqOutcome" aria-label="按结果筛选">
@@ -1212,6 +1323,25 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         </div>
       </div>
 
+      <!-- 错误汇总：日志环里的 WARN/ERR 按「账号 × 类型」聚合（见 errors.go）。
+           原始日志几十行同质 WARN 时，「谁报错 44 次、谁只 1 次」这个差异只能靠聚合才看得见。 -->
+      <div class="box">
+        <header>
+          <h3>错误汇总 <span class="hint">按账号 × 类型聚合，最该看的排最前</span></h3>
+          <span class="grow"></span>
+          <span class="note" id="errNote">—</span>
+        </header>
+        <div class="tbl-wrap req-wrap">
+          <table class="acc req">
+            <thead><tr>
+              <th>账号</th><th>类型</th><th>上游码</th><th>模型</th>
+              <th class="num">次数</th><th>最近</th><th>解除时刻</th><th>样本</th>
+            </tr></thead>
+            <tbody id="errBody"></tbody>
+          </table>
+        </div>
+      </div>
+
       <div class="box">
         <header>
           <h3>运行日志</h3>
@@ -1222,10 +1352,35 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
             <button class="xs chip" data-ch="chat">对话</button>
             <button class="xs chip" data-ch="sys">系统</button>
           </span>
-          <span class="note" id="logNote">最近 500 行</span>
+          <span class="note" id="logNote">每频道最近 500 行；任务日志可跨重启查询</span>
           <button class="xs" id="btnLogPin">自动滚动：开</button>
         </header>
         <pre id="logBox"></pre>
+      </div>
+
+      <div class="box">
+        <header>
+          <h3>积分历史 <span class="hint">每次真实查到余额与上次比对，变动即留痕</span></h3>
+          <span class="grow"></span>
+          <span class="note" id="creditNote">—</span>
+        </header>
+        <div class="fbar">
+          <select id="creditLimit" aria-label="读取条数">
+            <option value="100" selected>最近 100 条</option>
+            <option value="300">最近 300 条</option>
+            <option value="1000">最近 1000 条</option>
+          </select>
+          <span class="grow"></span>
+          <button class="xs" id="btnCreditReload">重新读取</button>
+        </div>
+        <div class="tbl-wrap">
+          <table class="acc">
+            <thead><tr>
+              <th>时间</th><th>账号</th><th class="num">变动</th><th class="num">变动后余额</th><th>说明</th>
+            </tr></thead>
+            <tbody id="creditBody"></tbody>
+          </table>
+        </div>
       </div>
     </section>
   </div>
@@ -1235,11 +1390,16 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 <div class="veil" id="taskVeil">
   <div class="dlg" style="width:940px">
     <header>
-      <h3>积分任务 <span class="hint" id="taskWho"></span></h3>
-      <div class="hint">查询上游任务进度；「接受」为报名（幂等），「领取」在进度达标后可用。所有操作走网关，无需外部脚本。</div>
+      <h3>账号任务 <span class="hint" id="taskWho"></span></h3>
+      <div class="hint">操作随账号能力开放；「领取」仅在进度达标后可用。</div>
     </header>
     <div class="body">
       <div class="state" id="taskState"><span class="dots">加载中</span></div>
+      <div class="hint" id="taskNote" hidden style="margin-bottom:12px"></div>
+      <div id="taskJobView" hidden style="margin-bottom:12px">
+        <div class="state" id="taskJobState" aria-live="polite"></div>
+        <details><summary class="hint">查看本次执行结果</summary><div id="taskJobResults"></div></details>
+      </div>
       <div class="tbl-wrap">
         <table class="acc md" id="taskTable" hidden>
           <thead><tr><th class="mark" aria-hidden="true"></th><th>任务</th><th>进度</th><th>奖励</th><th>状态</th><th class="c-acts"></th></tr></thead>
@@ -1250,26 +1410,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
     <footer>
       <span class="grow"></span>
       <button id="btnTaskAcceptAll">全部接受</button>
-      <button id="btnTaskAutoAll" class="primary">一键完成可自动任务</button>
+      <button id="btnTaskAutoAll" class="primary">后台完成可自动任务</button>
       <button id="btnTaskReload">重新查询</button>
       <button id="btnCloseTask">关闭</button>
-    </footer>
-  </div>
-</div>
-
-<!-- 开学季券码 -->
-<div class="veil" id="vcVeil">
-  <div class="dlg">
-    <header>
-      <h3>开学季 · 我的券码</h3>
-      <div class="hint">抽奖抽中的第三方券（KFC / 瑞幸 / 酷狗等），券码到店到对应app/小程序兑换。</div>
-    </header>
-    <div class="body" id="vcBody"></div>
-    <footer>
-      <span class="hint" id="vcNote"></span>
-      <span class="grow"></span>
-      <button class="xs" id="btnVcRefresh">刷新</button>
-      <button class="xs primary" id="btnVcClose">关闭</button>
     </footer>
   </div>
 </div>
@@ -1282,6 +1425,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       <div class="tabs" id="addTabs">
         <button class="tab on" data-tab="login">浏览器登录</button>
         <button class="tab" data-tab="import">导入 JSON</button>
+        <button class="tab" data-tab="apikey">API Key</button>
       </div>
     </header>
     <div class="body">
@@ -1304,6 +1448,15 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <div id="addDone" class="state ok" hidden></div>
         <div id="addErr" class="state err" hidden></div>
       </div>
+      <!-- 静态 API Key -->
+      <div id="addTabApiKey" class="tab-panel" hidden>
+        <div class="hint" style="margin-bottom:8px">粘贴 CodeBuddy 平台签发的静态 API Key（ck_/pt_ 前缀）。添加后直接可用、无需浏览器登录；该账号无签到 / 成长任务体系，额度走企业口径。</div>
+        <input type="password" id="apiKeyInput" placeholder="ck_..." autocomplete="off" style="width:100%;margin-bottom:8px">
+        <input type="text" id="apiKeyNickname" placeholder="昵称（可选）" autocomplete="off" style="width:100%;margin-bottom:8px">
+        <input type="text" id="apiKeyUid" placeholder="uid（可选，缺省由 key 派生）" autocomplete="off" style="width:100%;margin-bottom:8px">
+        <div id="apiKeyDone" class="state ok" hidden></div>
+        <div id="apiKeyErr" class="state err" hidden></div>
+      </div>
       <!-- 导入 JSON -->
       <div id="addTabImport" class="tab-panel" hidden>
         <div class="hint" style="margin-bottom:8px">选择 cockpit tools 导出的 JSON 文件，批量导入账号。文件需为账号数组格式。</div>
@@ -1315,6 +1468,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
     <footer>
       <span class="grow"></span>
       <button id="btnStartLogin" class="primary">获取授权链接</button>
+      <button id="btnAddApiKey" hidden class="primary">添加 API Key</button>
       <button id="btnCopyUrl" hidden>复制链接</button>
       <button id="btnOpenUrl" class="primary" hidden>在浏览器打开</button>
       <button id="btnCloseAdd">关闭</button>
@@ -1323,42 +1477,25 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 </div>
 
 <!-- 密钥 -->
-<div class="veil" id="keyCreateVeil" data-lock="1">
-  <div class="dlg" style="width:600px">
-    <header>
-      <h3 id="keyDlgTitle">新建密钥</h3>
-      <div class="hint">明文只在创建 / 重置时显示一次；管理面（面板与 <code>/status</code>）不向分发密钥开放。</div>
-    </header>
-    <div class="body">
-      <label class="fld"><span class="lb">名称</span>
-        <input id="keyName" maxlength="32" placeholder="如 张三"></label>
-      <div class="grid2">
-        <label class="fld"><span class="lb">模式</span>
-          <select id="keyMode">
-            <option value="bound">绑定账号（只用勾选的账号）</option>
-            <option value="global">全局池（走全局选号）</option>
-          </select>
-          <span class="hint" id="keyModeHint"></span></label>
-        <label class="fld"><span class="lb">过期时间</span>
-          <input type="datetime-local" id="keyExpires">
-          <span class="hint">留空 = 永不过期</span></label>
-      </div>
+<div class="veil" id="keyCreateVeil">
+  <div class="dlg" style="width:560px">
+    <h3 id="keyDlgTitle">新建密钥</h3>
+    <div class="pad">
+      <label>名称<input id="keyName" maxlength="32" placeholder="如 张三"></label>
+      <label>模式
+        <select id="keyMode">
+          <option value="global">全局池（与根密钥一样走全局选号）</option>
+          <option value="bound">绑定账号（只用勾选的账号）</option>
+        </select>
+      </label>
+      <label>过期时间（留空 = 永不过期）<input type="datetime-local" id="keyExpires"></label>
       <div id="keyUidsWrap" hidden>
-        <div class="khead">
-          <span class="lb">可用账号</span>
-          <span class="grow"></span>
-          <span class="note" id="keyUidsCount"></span>
-          <button type="button" class="xs" id="btnKeyUidsAll">全选</button>
-          <button type="button" class="xs" id="btnKeyUidsNone">清空</button>
-        </div>
+        <div class="note">勾选该密钥可使用的账号（严格模式：全部不可用时报 503，不借用其他账号）</div>
         <div id="keyUids" class="keyuids"></div>
-        <div class="hint">严格模式：该密钥只使用勾选的账号，全部不可用时直接 503，绝不借用其他账号。</div>
       </div>
-      <div class="switch" style="margin-top:6px"><span class="lb">启用</span>
-        <input type="checkbox" id="keyEnabled" checked></div>
+      <label class="row inline"><input type="checkbox" id="keyEnabled" checked> 启用</label>
     </div>
     <footer>
-      <span class="grow"></span>
       <button id="btnKeyCancel">取消</button>
       <button class="primary" id="btnKeySave">保存</button>
     </footer>
@@ -1381,7 +1518,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
   <div class="dlg" style="width:420px">
     <header>
       <h3>需要访问密钥</h3>
-      <div class="hint">该网关已启用 api_key 鉴权，请输入 config.json 中的密钥。连续输错会被临时锁定（见 config 的 security.login_lockout）。</div>
+      <div class="hint">该网关已启用 api_key 鉴权，请输入 config.json 中的密钥。</div>
     </header>
     <div class="body">
       <form style="display:contents" onsubmit="return false"><input type="password" id="keyInput" placeholder="api_key" autocomplete="off"></form>
@@ -1395,6 +1532,42 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 </div>
 
 <div id="toasts"></div>
+
+<!-- 账号备注：只写本机 localStorage，不写回服务器；账号池与用量两个视图同步显示 -->
+<div class="veil" id="remarkVeil">
+  <div class="dlg" style="width:560px">
+    <header>
+      <h3>账号备注</h3>
+      <div class="hint">备注只存在本机浏览器（localStorage: wb2api.remarks.v1），不写回后端；账号池与用量页会同时显示「备注 + 原昵称」。留空即清除该账号备注。</div>
+    </header>
+    <div class="body">
+      <div class="rm-list" id="remarkBody"></div>
+    </div>
+    <footer>
+      <button class="danger" id="btnRemarkClear">清空全部</button>
+      <span class="grow"></span>
+      <button id="btnRemarkClose">关闭</button>
+      <button class="primary" id="btnRemarkSave">保存</button>
+    </footer>
+  </div>
+</div>
+
+<!-- 开学季券码 -->
+<div class="veil" id="vcVeil">
+  <div class="dlg">
+    <header>
+      <h3>开学季 · 我的券码</h3>
+      <div class="hint">抽奖抽中的第三方券（KFC / 瑞幸 / 酷狗等），券码到店到对应app/小程序兑换。</div>
+    </header>
+    <div class="body" id="vcBody"></div>
+    <footer>
+      <span class="hint" id="vcNote"></span>
+      <span class="grow"></span>
+      <button class="xs" id="btnVcRefresh">刷新</button>
+      <button class="xs primary" id="btnVcClose">关闭</button>
+    </footer>
+  </div>
+</div>
 
 <script src="app.js"></script>
 </body>

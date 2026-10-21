@@ -9,7 +9,6 @@ package scheduler
 import (
 	"encoding/json"
 	"log"
-	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
@@ -27,10 +26,14 @@ func (s *Scheduler) RunStreakBonusNow() {
 			continue
 		}
 		if a.IsGlobal() {
-			continue // D4 门控：global 无 CN 任务体系，不发起任何上游调用
+			// D4 门控只覆盖 CN 成长体系（连登/补签/兑换/抽奖走 CN web base）。礼包与补偿是
+			// billing 域、按 realm 走 base，国际号实测 200——一并跳过就会静默漏领国际区活动。
+			s.claimGiftQuiet(a)
+			s.claimCompensationQuiet(a)
+			continue
 		}
-		if a.IsEnterprise() {
-			continue // 企业版门控：无成长体系（/activity/growth/streak 上游一律 403）
+		if !a.SupportsPersonalGrowth() {
+			continue // 企业版 / 静态 API Key 门控：无个人成长体系
 		}
 		s.streakBonusAccount(a)
 	}
@@ -38,19 +41,16 @@ func (s *Scheduler) RunStreakBonusNow() {
 
 // streakBonusAccount 单账号：补签保连登 → 礼包/补偿 → 兑换所有已解锁档位 → 抽完所有 chances。
 func (s *Scheduler) streakBonusAccount(a *auth.Auth) {
-	// 0. 补签保连登：昨日漏签且有补签卡则补上（连续天数一断就要重攒 7 天）。
-	s.makeupYesterday(a)
-	// 0.5 礼包/补偿（每号一次，无则业务错误静默跳过）。
-	if credit, err := s.cfg.Upstream.ClaimGift(a); err == nil {
-		log.Printf("streak-bonus %s: 🎊 新手礼包 +%dc", logfmt.Label(a.UID, a.Nickname), credit)
-	}
-	if credit, err := s.cfg.Upstream.ClaimCompensation(a); err == nil {
-		log.Printf("streak-bonus %s: 🎊 补偿领取 +%dc", logfmt.Label(a.UID, a.Nickname), credit)
-	}
+	// 0. 补签保连登：本月漏签且有补签卡则从最近一天往回补（连续天数一断就要重攒 7 天）。
+	s.makeupMissed(a)
+	// 0.5 礼包 + 补偿：两者都走「先查状态 → 待领才领」（见 compensation.go）。
+	// 盲领会把「无活动/已领过」打成假的「+0c」成功行，真失败反倒无痕。
+	s.claimGiftQuiet(a)
+	s.claimCompensationQuiet(a)
 
 	full, err := s.cfg.Upstream.GrowthStreakFull(a)
 	if err != nil {
-		log.Printf("streak-bonus %s: %v", logfmt.Label(a.UID, a.Nickname), err)
+		log.Printf("WARN: streak-bonus %s: %v", logfmt.Label(a.UID, a.Nickname), err)
 		return
 	}
 	statuses := map[string]string{
@@ -65,7 +65,7 @@ func (s *Scheduler) streakBonusAccount(a *auth.Auth) {
 		}
 		if err := s.cfg.Upstream.GrowthRedeemTier(a, tier.Tier); err != nil {
 			// 未解锁（403）属预期，静默；其余记日志。
-			log.Printf("streak-bonus %s: redeem %s: %v", logfmt.Label(a.UID, a.Nickname), tier.Tier, err)
+			log.Printf("WARN: streak-bonus %s: redeem %s: %v", logfmt.Label(a.UID, a.Nickname), tier.Tier, err)
 			continue
 		}
 		log.Printf("streak-bonus %s: ★ 兑换 %s 档（+%dc +%de 卡×%d 抽奖×%d）",
@@ -74,13 +74,13 @@ func (s *Scheduler) streakBonusAccount(a *auth.Auth) {
 	// 抽奖：按当前 chances 全抽完（兑换刚发的次数已在服务端累加）。
 	chances, err := s.cfg.Upstream.LotteryChances(a)
 	if err != nil {
-		log.Printf("streak-bonus %s: lottery summary: %v", logfmt.Label(a.UID, a.Nickname), err)
+		log.Printf("WARN: streak-bonus %s: lottery summary: %v", logfmt.Label(a.UID, a.Nickname), err)
 		return
 	}
 	for i := 0; i < chances; i++ {
 		raw, err := s.cfg.Upstream.LotteryDraw(a)
 		if err != nil {
-			log.Printf("streak-bonus %s: draw: %v", logfmt.Label(a.UID, a.Nickname), err)
+			log.Printf("WARN: streak-bonus %s: draw: %v", logfmt.Label(a.UID, a.Nickname), err)
 			return
 		}
 		log.Printf("streak-bonus %s: 🎲 第%d抽 %s", logfmt.Label(a.UID, a.Nickname), i+1, compactJSON(raw))
@@ -92,28 +92,33 @@ func (s *Scheduler) streakBonusAccount(a *auth.Auth) {
 
 // compactJSON 裁剪奖品载荷（日志单行可读）。
 func compactJSON(raw json.RawMessage) string {
-	s := string(raw)
-	if len(s) > 220 {
-		return s[:220] + "…"
+	// logfmt.Truncate 回退到 UTF-8 rune 边界：奖品名是中文，按字节切会打出半个字。
+	s := logfmt.Truncate(string(raw), 220)
+	if len(raw) > 220 {
+		s += "…"
 	}
 	return s
 }
 
-// makeupYesterday 昨日漏签且有补签卡时自动补签（保住连登连续天数）。
+// makeupMissed 本月漏签且有补签卡时自动补签（保住连登连续天数）。
+// 从最近一天往回补（最近的最值钱），最多补到卡用光。
+// 上游拒绝即停：注册前的日子同样是 0 分，无法与漏签区分，只能由拒绝兜底。
 // 无卡 / 无漏签 / 查询失败均静默（不影响主流程）。
-func (s *Scheduler) makeupYesterday(a *auth.Auth) {
-	missed, err := s.cfg.Upstream.HeatmapYesterdayMissed(a)
-	if err != nil || !missed {
+func (s *Scheduler) makeupMissed(a *auth.Auth) {
+	broken, err := s.cfg.Upstream.HeatmapBrokenDates(a)
+	if err != nil || len(broken) == 0 {
 		return
 	}
 	full, err := s.cfg.Upstream.GrowthStreakFull(a)
 	if err != nil || full.MakeupCards.Balance <= 0 {
 		return
 	}
-	yesterday := time.Now().AddDate(0, 0, -1).Format("2006-01-02")
-	if err := s.cfg.Upstream.UseMakeupCard(a, yesterday); err != nil {
-		log.Printf("streak-bonus %s: 补签 %s 失败: %v", logfmt.Label(a.UID, a.Nickname), yesterday, err)
-		return
+	for i, n := 0, min(full.MakeupCards.Balance, len(broken)); i < n; i++ {
+		d := broken[len(broken)-1-i]
+		if err := s.cfg.Upstream.UseMakeupCard(a, d); err != nil {
+			log.Printf("WARN: streak-bonus %s: 补签 %s 失败: %v", logfmt.Label(a.UID, a.Nickname), d, err)
+			return
+		}
+		log.Printf("streak-bonus %s: ★ 已用补签卡补签 %s（保连登）", logfmt.Label(a.UID, a.Nickname), d)
 	}
-	log.Printf("streak-bonus %s: ★ 已用补签卡补签 %s（保连登）", logfmt.Label(a.UID, a.Nickname), yesterday)
 }

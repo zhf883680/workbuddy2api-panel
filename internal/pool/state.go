@@ -5,7 +5,9 @@ package pool
 import (
 	"fmt"
 	"log"
+	"math"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -31,6 +33,16 @@ func (p *Pool) Disable(uid, reason string) {
 // 即使账号已 disabled，计数仍累计并返回 false 前 N-1 次——但 keepalive 会跳过
 // disabled 号，实际只有「已 disabled 后复活且计数未清」这类场景才会走到这里。
 func (p *Pool) NoteSessionDead(uid string) bool {
+	return p.NoteSessionDeadWith(uid, sessionDeadReason)
+}
+
+// NoteSessionDeadWith 同 NoteSessionDead，但由调用方指定持久化 reason。
+//
+// 用途：网关层 401（APISIX `invalid_token`，无业务信封）与业务码 12153 是两种
+// 不同的死法，面板的「禁用原因」要把它们分开，否则运维看到 12153 会去查 refresh
+// 链路，而实际是 token 被边缘判无效、只能重登。计数/阈值语义与 12153 完全共用
+// （同一个 sessionDeadFails 计数，成功即由 ClearSessionDead 清零）。
+func (p *Pool) NoteSessionDeadWith(uid, reason string) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	e, ok := p.byUID[uid]
@@ -42,7 +54,7 @@ func (p *Pool) NoteSessionDead(uid string) bool {
 		return false
 	}
 	e.sessionDeadFails = 0
-	p.disableLocked(e, sessionDeadReason)
+	p.disableLocked(e, reason)
 	return true
 }
 
@@ -93,6 +105,10 @@ func (p *Pool) Revive(uid string) bool {
 	e.fails = 0
 	e.retryCount = 0
 	e.breakerUntil = time.Time{}
+	// 连败降权一并清：「降权中」的账号在面板同样显示「解冻」，但只清冷却/熔断会让
+	// 点完按钮的账号仍被 degradeUntil 挡在池外（frozen = disabled || 降权中）。
+	e.consecutiveFails = 0
+	e.degradeUntil = time.Time{}
 	p.dirty.Store(true)
 	return true
 }
@@ -140,11 +156,13 @@ func (p *Pool) ReenableIfCredits(uid string, remain, total int64) {
 			e.credits = remain
 			e.creditsTotal = total
 		}
-		// ReenableIfCredits 只有聚合余额上下文；到期明细必须由 SetCreditsDetailed
+		e.creditsRemainder = 0 // 权威余额整写：亚积分余量作废
+		// ReenableIfCredits 只有聚合余额上下文；到期明细必须由 SetCreditsSnapshot
 		// 重新写入，不能沿用旧窗口/旧批次的缓存。
 		e.creditsExpiring = 0
 		e.creditsEarliestExpiry = time.Time{}
 		e.creditsEarliestRemaining = 0
+		e.expiryBuckets = nil
 		p.dirty.Store(true)
 	}
 }
@@ -207,13 +225,13 @@ func (p *Pool) NoteSuccess(uid string) {
 // （ReenableIfCredits/SetCreditsDetailed 以 authoritative 余额重置），扣减只是
 // 两次签到之间的内插估计；credit=0（免费请求）不动余额。
 func (p *Pool) NoteModelCost(uid, model string, credit float64, tokens int) {
-	if uid == "" || model == "" || tokens <= 0 {
+	if uid == "" || model == "" || tokens <= 0 || math.IsNaN(credit) || math.IsInf(credit, 0) || credit < 0 {
 		return
 	}
 	// 单价按每千 token 归一，消除请求长度差异。
 	per1k := credit / float64(tokens) * 1000
-	if per1k < 0 {
-		per1k = 0
+	if math.IsInf(per1k, 0) {
+		per1k = math.MaxFloat64
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -222,11 +240,11 @@ func (p *Pool) NoteModelCost(uid, model string, credit float64, tokens int) {
 		return
 	}
 	if credit > 0 {
-		d := int64(credit + 0.5) // 四舍五入
-		if d > e.credits {
-			d = e.credits // 钳 0：扣穿（对账延迟/消费早于记账）不产生负余额
-		}
-		e.credits -= d
+		// 小数积分保留（上游 PR #104）：整数 credits 只作对外口径（最近整数），
+		// 亚积分消耗存 creditsRemainder —— 10 次 0.1 扣费不再被四舍五入吞掉。
+		oldCredits := e.credits
+		e.setExactCredits(e.exactCredits() - credit)
+		d := oldCredits - e.credits // 到期快照仍以既有整数口径递减
 		if e.creditsExpiring > 0 {
 			if d > e.creditsExpiring {
 				e.creditsExpiring = 0
@@ -234,6 +252,40 @@ func (p *Pool) NoteModelCost(uid, model string, credit float64, tokens int) {
 				e.creditsExpiring -= d
 			}
 		}
+		p.deductExpiryLocked(e, d)
+	}
+	if e.modelCost == nil {
+		e.modelCost = make(map[string]modelCostEntry)
+	}
+	const alpha = 0.3
+	prev, seen := e.modelCost[model]
+	if !seen {
+		e.modelCost[model] = modelCostEntry{CostPer1k: per1k, LastSeen: time.Now(), Samples: 1, CreditVerified: true}
+	} else {
+		// 限免结束事件（判定在写入口，只看覆盖前值）：此前 tier 0（实测免费，
+		// per1k≤0）且本次实测收费（per1k>0）——账号在该模型上的免费窗口结束。
+		if prev.CostPer1k <= 0 && per1k > 0 {
+			log.Printf("[pool] model %s on uid %s: free tier ended, now %.3f credits/1k", model, logfmt.UID8(uid), per1k)
+		}
+		e.modelCost[model] = modelCostEntry{
+			CostPer1k:      prev.CostPer1k*(1-alpha) + per1k*alpha,
+			LastSeen:       time.Now(),
+			Samples:        prev.Samples + 1,
+			CreditVerified: true,
+		}
+	}
+	p.dirty.Store(true) // 账本已持久化：写入口统一置脏
+}
+
+// deductExpiryLocked 按 FEFO 近似扣减到期快照：先从最早的自然日桶扣，扣穿再顺延。
+// 有 buckets 时同步重算 earliestAt/earliestRemaining（下一桶的 ExpireAt 成为新最早批次），
+// 使两次余额刷新之间的首页快照仍随用量收敛；无 buckets（旧状态/测试只写了聚合字段）
+// 时退回只扣最早一批。调用方必须已持有 p.mu。
+func (p *Pool) deductExpiryLocked(e *entry, d int64) {
+	if d <= 0 {
+		return
+	}
+	if len(e.expiryBuckets) == 0 {
 		if e.creditsEarliestRemaining > 0 {
 			if d >= e.creditsEarliestRemaining {
 				e.creditsEarliestRemaining = 0
@@ -242,27 +294,39 @@ func (p *Pool) NoteModelCost(uid, model string, credit float64, tokens int) {
 				e.creditsEarliestRemaining -= d
 			}
 		}
+		return
 	}
-	if e.modelCost == nil {
-		e.modelCost = make(map[string]modelCostEntry)
+	left := d
+	for i := range e.expiryBuckets {
+		if left == 0 {
+			break
+		}
+		b := &e.expiryBuckets[i]
+		if b.Remain <= 0 {
+			continue
+		}
+		take := b.Remain
+		if take > left {
+			take = left
+		}
+		b.Remain -= take
+		left -= take
 	}
-	const alpha = 0.3
-	prev, seen := e.modelCost[model]
-	if !seen {
-		e.modelCost[model] = modelCostEntry{CostPer1k: per1k, LastSeen: time.Now(), Samples: 1}
+	// 清掉被扣穿的桶（保持升序；切片原地过滤）。
+	out := e.expiryBuckets[:0]
+	for _, b := range e.expiryBuckets {
+		if b.Remain > 0 {
+			out = append(out, b)
+		}
+	}
+	e.expiryBuckets = out
+	if len(e.expiryBuckets) > 0 {
+		e.creditsEarliestExpiry = e.expiryBuckets[0].ExpireAt
+		e.creditsEarliestRemaining = e.expiryBuckets[0].Remain
 	} else {
-		// 限免结束事件（判定在写入口，只看覆盖前值）：此前 tier 0（实测免费，
-		// per1k≤0）且本次实测收费（per1k>0）——账号在该模型上的免费窗口结束。
-		if prev.CostPer1k <= 0 && per1k > 0 {
-			log.Printf("[pool] model %s on uid %s: free tier ended, now %.3f credits/1k", model, logfmt.UID8(uid), per1k)
-		}
-		e.modelCost[model] = modelCostEntry{
-			CostPer1k: prev.CostPer1k*(1-alpha) + per1k*alpha,
-			LastSeen:  time.Now(),
-			Samples:   prev.Samples + 1,
-		}
+		e.creditsEarliestExpiry = time.Time{}
+		e.creditsEarliestRemaining = 0
 	}
-	p.dirty.Store(true) // 账本已持久化：写入口统一置脏
 }
 
 // RecordTokenUsage 记录一次实际发起的聊天账号尝试及上游返回的 usage 增量。
@@ -383,7 +447,7 @@ func (p *Pool) PickByUIDForModel(uid, model string) *auth.Auth {
 		return nil
 	}
 	now := time.Now()
-	if !e.healthyForModel(now, model) {
+	if !p.selectable(e, now, model) {
 		return nil
 	}
 	// 积分保底（粘性路径）：与 pick 的 floorBlocked 同判据——触底 + 收费即拦
@@ -395,9 +459,6 @@ func (p *Pool) PickByUIDForModel(uid, model string) *auth.Auth {
 	if p.floorBlockedForRealmModel(e, model, e.a.Realm(), now) {
 		log.Printf("WARN: [pool] credit floor: sticky acct=%s model=%s credits=%d < floor=%d, unbind (paid model held out)",
 			logfmt.Label(e.a.UID, e.a.Nickname), model, e.credits, p.creditFloor)
-		return nil
-	}
-	if p.inFlightFull(e) {
 		return nil
 	}
 	e.lastUsed = now
@@ -416,10 +477,7 @@ func (p *Pool) PickByUID(uid string) *auth.Auth {
 		return nil
 	}
 	now := time.Now()
-	if !e.healthy(now) {
-		return nil
-	}
-	if p.inFlightFull(e) {
+	if !p.selectable(e, now, "") {
 		return nil
 	}
 	e.lastUsed = now
@@ -433,9 +491,10 @@ func (p *Pool) PickByUID(uid string) *auth.Auth {
 // 注意：healthy 口径不含 inFlight 维度（是状态机权威判定，只看 disabled/until/breakerUntil）；
 // inFlightFull 是 healthy 的子集——healthy 里已达在途上限的账号数，供 /status 透出满载度。
 // 与 ServableNow 的区别见该函数注释。
-// 保持既有语义：paused 并入 disabled（= /status 的「不可用」口径）。监控/脚本只
-// 关心"还能不能用"，这个口径对它们是稳定契约，不因面板展示需要而改变。
-// 面板概况需要分开计数，用 CountsDetailedWithPaused。
+//
+// **口径**：paused（暂停选号）并入 disabled = /status 的「不可用」语义。监控与脚本只关心
+// 「还能不能用」，这是它们的稳定契约，不因面板展示需要而改变。面板概况要分开计数，用
+// CountsDetailedWithPaused（吸收上游 PR #130 的修法：拆分点只留一处，调用方各自声明口径）。
 func (p *Pool) CountsDetailed() (total, healthy, cooling, disabled, inFlightFull int) {
 	t, h, c, d, pz, f := p.countsDetailedForRealm("")
 	return t, h, c, d + pz, f
@@ -443,8 +502,8 @@ func (p *Pool) CountsDetailed() (total, healthy, cooling, disabled, inFlightFull
 
 // CountsDetailedWithPaused 同 CountsDetailed，但 paused 与 disabled 分开返回。
 //
-// 面板概况要回答「禁用几个、暂停几个」——暂停只关选号、照常签到保活，与禁用混成
-// 一个数字会让人误判池子的真实状况（issue #125）。
+// 面板概况要回答「禁用几个、暂停几个」：暂停只关选号、照常签到/活跃/保活/刷余额，与
+// 禁用是两种运维状态，混成一个数字会让人误判池子的真实状况（issue #125）。
 func (p *Pool) CountsDetailedWithPaused() (total, healthy, cooling, disabled, paused, inFlightFull int) {
 	return p.countsDetailedForRealm("")
 }
@@ -456,39 +515,177 @@ func (p *Pool) CountsDetailedForRealm(realm string) (total, healthy, cooling, di
 	return t, h, c, d + pz, f
 }
 
-// countsDetailedForRealm 是两函数共用的遍历实现；realm=="" 不加谓词。
-// countsDetailedForRealm 是共用遍历实现；realm=="" 不加谓词。
-//
-// paused 单独返回、不并进 disabled：调用方按自己的口径决定合不合并。
-// /status 要的是「还能不能用」（暂停与禁用同样不可选，合并）；面板概况要的是
-// 「禁用几个、暂停几个」（分开，issue #125）。两种口径都合理，所以把选择权
-// 留在调用方，而不是让一个共享函数替所有人做决定。
+// countsDetailedForRealm 委托 RealmHealth，避免 /status 与 /metrics 各算一套。
+// paused 单独返回、不并进 disabled：调用方按自己的口径决定合不合并（/status 合，
+// 面板分）。两种口径都合理，所以选择权留在调用方，而不是让共享遍历替所有人决定。
 func (p *Pool) countsDetailedForRealm(realm string) (total, healthy, cooling, disabled, paused, inFlightFull int) {
+	h := p.RealmHealth(realm)
+	return h.Total, h.Healthy, h.Cooling, h.Disabled, h.Paused, h.InFlightFull
+}
+
+// RealmHealth 现算，不另存计数器。
+// Breaker/Degraded 与 Cooling 有交集。ManualDisabled 本面板没有单独标志，恒 0。
+type RealmHealth struct {
+	Total   int
+	Healthy int
+	Cooling int
+	// Disabled 仅统计**已禁用**；Paused（暂停选号）单列——两者对监控口径不同：
+	// /status 与 /metrics 的「不可用」要合并（d+p）由调用方各自加，见 countsDetailedForRealm。
+	Disabled       int
+	Paused         int
+	InFlightFull   int
+	Breaker        int
+	Degraded       int
+	ManualDisabled int
+	ModelCooled    int
+	InFlight       int
+}
+
+func (p *Pool) RealmHealth(realm string) RealmHealth {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	now := time.Now()
+	var h RealmHealth
 	for _, e := range p.byUID {
 		if realm != "" && e.a.Realm() != realm {
 			continue
 		}
-		total++
+		h.Total++
 		switch {
-		case e.disabled:
-			disabled++
-		case e.paused:
-			// 暂停选号：退出选号候选，但照常签到 / 活跃上报 / 保活 / 刷新余额。
-			// 它与「禁用」是两种运维状态，这里分开计；要不要合并由调用方决定。
-			paused++
+		case e.disabled || e.paused:
+			// 两者都不可选，但分开计数：disabled 是「判死」（需人工解冻），paused 是
+			// 「临时让位」（照常保号）。合并口径由调用方声明（/status、/metrics 合并；
+			// 面板概况分开，见 CountsDetailedWithPaused）。
+			if e.disabled {
+				h.Disabled++
+			} else {
+				h.Paused++
+			}
 		case !e.healthy(now):
-			cooling++
+			h.Cooling++
 		default:
-			healthy++
+			h.Healthy++
 			if p.inFlightFull(e) {
-				inFlightFull++
+				h.InFlightFull++
 			}
 		}
+		if !e.breakerUntil.IsZero() && now.Before(e.breakerUntil) {
+			h.Breaker++
+		}
+		if !e.degradeUntil.IsZero() && now.Before(e.degradeUntil) {
+			h.Degraded++
+		}
+		for _, mc := range e.modelCooldowns {
+			if !mc.Until.IsZero() && now.Before(mc.Until) {
+				h.ModelCooled++
+				break
+			}
+		}
+		h.InFlight += int(e.inFlight.Load())
 	}
-	return total, healthy, cooling, disabled, paused, inFlightFull
+	return h
+}
+
+// AllHardCreditForRealm 报告「该域一个可用号都没有，且挡路的全是余额耗尽冷却」
+// （CoolHard）。realm=="" 统计全池。
+//
+// 用于把「无可用账号」细化成语义化的积分耗尽错误（429 + insufficient_quota，
+// 客户端据此不再徒劳重试）。保守判定：有任一健康号/软冷却号/禁用号即 false——
+// 只有唯一原因是积分耗尽时才成立；调用点本就只在池不可服务时才会问。
+func (p *Pool) AllHardCreditForRealm(realm string) bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	now := time.Now()
+	n := 0
+	for _, e := range p.byUID {
+		if realm != "" && e.a.Realm() != realm {
+			continue
+		}
+		if e.disabled || e.healthy(now) || e.coolKind != CoolHard {
+			return false
+		}
+		n++
+	}
+	return n > 0
+}
+
+// reserveBlocked 报告账号是否因「保留积分」停牌（不再接单）。调用方须持锁。
+// 阈值 0 = 关闭；只拦**已知**余额（creditsTotal > 0，与 Status.CreditsTotal 的
+// 「0 = 未知」同口径）——从未查过余额的账号不受影响，否则全新装机看起来整池不可用。
+// modelFree=true（请求模型是免费档）时恒 false：额度耗尽连 x0.00 免费档也会 429 14018，
+// 见底的号要把最后额度留给免费模型（保命模式付费/免费档分流，借鉴 swysgh/workbuddy2api）。
+func (p *Pool) reserveBlocked(e *entry, modelFree bool) bool {
+	if modelFree {
+		return false
+	}
+	return p.reserveCredits > 0 && e.creditsTotal > 0 && e.credits <= p.reserveCredits
+}
+
+// modelFreeOf 报告 (账号域, 模型) 是否免费档：上游目录倍率数值为 0。
+// 与 floorBlockedForRealmModel 同一查表（modelRateOf，含优惠价折算 effectiveModelRate），
+// 两条保号判据对「收费/免费」的口径必然一致。model 为空 / 目录未覆盖 / 倍率异常 →
+// false（保守：当付费处理——免费档豁免宁可不发）。调用方须持锁。
+func (p *Pool) modelFreeOf(e *entry, model string) bool {
+	if model == "" || p.modelRateOf == nil {
+		return false
+	}
+	rate := p.modelRateOf(e.a.Realm(), model)
+	if rate == "" {
+		return false
+	}
+	v, err := strconv.ParseFloat(rate, 64)
+	return err == nil && v == 0
+}
+
+// priorityOf / shareOf 读账号级路由偏好（issue #62），缺省 0 = 未配置。调用方须持锁。
+// nil map 取值为零值，无需判空。
+func (p *Pool) priorityOf(uid string) int  { return p.accountPriority[uid] }
+func (p *Pool) shareOf(uid string) float64 { return p.accountShare[uid] }
+
+// prioritizeLocked 按账号优先级收窄候选（issue #62）：取候选里最小的优先级值（>0），
+// 只留该层；无任何候选配置优先级时原样返回（零配置零影响）。调用方须持锁。
+// 收窄后候选必非空（best 来自某个候选本身）。
+func (p *Pool) prioritizeLocked(cands []*entry) []*entry {
+	best := 0
+	for _, e := range cands {
+		if pr := p.priorityOf(e.a.UID); pr > 0 && (best == 0 || pr < best) {
+			best = pr
+		}
+	}
+	if best == 0 {
+		return cands
+	}
+	out := make([]*entry, 0, len(cands))
+	for _, e := range cands {
+		if p.priorityOf(e.a.UID) == best {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// sharePoolLocked 返回候选里配了占比的账号（无 → nil）。调用方须持锁。
+func (p *Pool) sharePoolLocked(cands []*entry) []*entry {
+	var out []*entry
+	for _, e := range cands {
+		if p.shareOf(e.a.UID) > 0 {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// selectable 选号判据（调用方须持锁）：健康（model 非空走 6004 模型豁免口径）+
+// 未占满在途 + 未因保留积分停牌（免费档豁免，见 modelFreeOf）。选号入口统一走这里，
+// 「不可选」的 policy 只此一处。
+func (p *Pool) selectable(e *entry, now time.Time, model string) bool {
+	if p.inFlightFull(e) || p.reserveBlocked(e, p.modelFreeOf(e, model)) {
+		return false
+	}
+	if model != "" {
+		return e.healthyForModel(now, model)
+	}
+	return e.healthy(now)
 }
 
 // ServableNow 报告池当前是否可服务：存在至少一个 healthy 且未占满在途名额的账号。
@@ -512,6 +709,9 @@ func (p *Pool) ServableForRealm(realm string) bool {
 		}
 		if p.inFlightFull(e) {
 			continue
+		}
+		if p.reserveBlocked(e, false) {
+			continue // 保留积分停牌号不接单 → 不算可服务（同 inFlightFull 口径；探活无模型上下文，按付费口径）
 		}
 		// 存在性语义：账号级 healthy，或处于模型级豁免形态（6004 单模型软冷却——
 		// 对触发模型不可用，对其他模型仍可选）。探活无请求模型上下文，取"存在可服务
@@ -546,33 +746,46 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		// 每模型一行（modelCooldowns 内未到期的条目），多模型同时限流全部展示。
 		// 到期判据 = 该模型的独立冷却 until 未过；条件满足才输出，随到期自然消失，
 		// 普通软冷却（无模型级表）/硬冷却不产生台账（零回归）。
+		ReserveBlocked:           p.reserveBlocked(e, false),
 		RateLimitedModels:        p.rateLimitedModelsLocked(e, now),
 		Realm:                    e.a.Realm(),
 		Enterprise:               e.a.IsEnterprise(),
+		APIKey:                   e.a.IsAPIKey(),
 		Nickname:                 e.a.Nickname,
 		Credits:                  e.credits,
 		CreditsTotal:             e.creditsTotal,
 		CreditsExpiring:          e.creditsExpiring,
 		CreditsEarliestExpiry:    e.creditsEarliestExpiry,
 		CreditsEarliestRemaining: e.creditsEarliestRemaining,
-		Cooling:                  now.Before(e.until) || now.Before(e.breakerUntil),
-		Reason:                   e.reason,
-		Disabled:                 e.disabled,
-		Paused:                   e.paused,
-		SuccessCount:             e.successCount,
-		ErrTotal:                 e.errTotal,
-		CheckinDone:              e.lastCheckinDay == now.Format("2006-01-02"),
-		TokenUsage:               e.tokenUsage,
-		LastSuccessTime:          e.lastSuccess,
-		LastErrTime:              e.lastErr,
-		Until:                    e.until,
-		SoftStreak:               e.softStreak,
-		ModelCosts:               p.modelCostsStatusLocked(e, now),
-		ConsecutiveFails:         e.consecutiveFails,
-		DegradeUntil:             e.degradeUntil,
-		InFlight:                 int(e.inFlight.Load()),
-		BreakerFails:             e.fails,
-		BreakerUntil:             e.breakerUntil,
+		// 拷贝一份：List 返回后 JSON 序列化在锁外进行，不能与 NoteModelCost 的
+		// 原地扣减共享底层数组（数据竞争）。
+		CreditsExpiryBuckets: append([]ExpiryBucket(nil), e.expiryBuckets...),
+		Priority:             p.priorityOf(uid),
+		Share:                p.shareOf(uid),
+		Cooling:              now.Before(e.until) || now.Before(e.breakerUntil),
+		SessionDeadFails:     e.sessionDeadFails,
+		Disabled:             e.disabled,
+		Paused:               e.paused,
+		SuccessCount:         e.successCount,
+		ErrTotal:             e.errTotal,
+		CheckinDone:          e.lastCheckinDay == now.Format("2006-01-02"),
+		TokenUsage:           e.tokenUsage,
+		LastSuccessTime:      e.lastSuccess,
+		LastErrTime:          e.lastErr,
+		Until:                e.until,
+		SoftStreak:           e.softStreak,
+		ModelCosts:           p.modelCostsStatusLocked(e, now),
+		ConsecutiveFails:     e.consecutiveFails,
+		DegradeUntil:         e.degradeUntil,
+		InFlight:             int(e.inFlight.Load()),
+		BreakerFails:         e.fails,
+		BreakerUntil:         e.breakerUntil,
+	}
+	// Reason 只在冷却/禁用时透出（issue #171-1）：软冷却按墙钟恢复、到期不会清理字段
+	// （Cooldown/CooldownSoftRate 写、NoteSuccess 不碰），无条件透出会让面板把「可用」
+	// 和一周前的「429 rate limit」并排显示，分不清是历史残留还是当前限流。
+	if st.Cooling || st.Disabled {
+		st.Reason = e.reason
 	}
 	if st.Disabled {
 		// 禁用账号透出禁用原因（运维看不到为什么死）。
@@ -654,8 +867,11 @@ func (p *Pool) rateLimitedModelsLocked(e *entry, now time.Time) []RateLimitedMod
 	for _, m := range models {
 		mc := e.modelCooldowns[m]
 		if !mc.Until.IsZero() && now.Before(mc.Until) {
+			// 11102/11158 是「确定性模型拒绝」（该模型在本域不存在 / 这个号没这个模型
+			// 的权限），不是限流：台账 kind 必须区分，否则运维会把「换个号就能用」误读成
+			// 「等限流恢复」。前缀口径与 BlockModelClear 一致。
 			kind := "rate_limit"
-			if strings.HasPrefix(mc.Reason, "11102") {
+			if strings.HasPrefix(mc.Reason, "11102") || strings.HasPrefix(mc.Reason, "11158") {
 				kind = "model_unavailable"
 			}
 			row := RateLimitedModel{

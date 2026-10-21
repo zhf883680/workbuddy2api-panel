@@ -174,6 +174,46 @@ func TestRequestMetricsCapturesClientInfo(t *testing.T) {
 	}
 }
 
+// 来源采集/归档/X-Request-Id 对四条入站协议路径一视同仁：/v1/responses 与
+// /v1/messages（含 /messages 别名）经 r.Clone 转进 chatCompletions，此前入口
+// 中间件只放行 /v1/chat/completions —— Codex 客户端整类请求因此无来源、不入
+// 归档、响应也无请求 ID（行里没有 src/ua 段）。此测试钉住四条路径拿到同一份 trace。
+func TestRequestMetricsCoversAllProtocolEntries(t *testing.T) {
+	cases := []struct{ name, path, body string }{
+		{"chat", "/v1/chat/completions", `{"model":"glm-5.2","stream":true,"messages":[]}`},
+		{"responses", "/v1/responses", `{"model":"glm-5.2","input":"hi","stream":true}`},
+		{"messages", "/v1/messages", `{"model":"glm-5.2","max_tokens":16,"messages":[{"role":"user","content":"hi"}],"stream":true}`},
+		{"messages-alias", "/messages", `{"model":"glm-5.2","max_tokens":16,"messages":[{"role":"user","content":"hi"}],"stream":true}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			up := newFakeUpstream(t, func(string) (int, string, bool) { return 200, sseOK, true })
+			reqLog := reqlog.New(reqlog.Config{})
+			h := NewHandler(Config{
+				Pool:             testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+				Upstream:         up,
+				RequestLog:       reqLog,
+				RecordClientInfo: true,
+			})
+			req := httptest.NewRequest("POST", tc.path, strings.NewReader(tc.body))
+			req.Header.Set("X-Forwarded-For", "203.0.113.7, 10.0.0.1")
+			req.Header.Set("User-Agent", "codex_cli_rs/0.44.0")
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+			if got := rec.Header().Get("X-Request-Id"); !strings.HasPrefix(got, "req-") {
+				t.Errorf("X-Request-Id=%q want req- 前缀", got)
+			}
+			s := reqLog.Snapshot()
+			if len(s.Recent) != 1 {
+				t.Fatalf("recent = %+v", s.Recent)
+			}
+			if e := s.Recent[0]; e.Path != tc.path || e.ClientIP != "203.0.113.7" || e.UserAgent != "codex_cli_rs/0.44.0" {
+				t.Errorf("归档事件 = path:%q ip:%q ua:%q", e.Path, e.ClientIP, e.UserAgent)
+			}
+		})
+	}
+}
+
 // 开关关闭时不采集来源（归档里不出现 IP/UA），但请求指标照常记录。
 func TestRequestMetricsClientInfoDisabled(t *testing.T) {
 	up := newFakeUpstream(t, func(string) (int, string, bool) {
@@ -255,14 +295,11 @@ func TestRequestMetricsDetectsStreamErrorFrame(t *testing.T) {
 	}
 }
 
-func TestParseModelFromBody(t *testing.T) {
-	if got := parseModelFromBody([]byte(`{"model":"deepseek-v4-flash","stream":true}`)); got != "deepseek-v4-flash" {
+func TestNewChatStatModelFallback(t *testing.T) {
+	if got := newChatStat(time.Now(), "deepseek-v4-flash", true, nil).model; got != "deepseek-v4-flash" {
 		t.Errorf("got %q", got)
 	}
-	if got := parseModelFromBody([]byte(`{}`)); got != "-" {
-		t.Errorf("got %q want -", got)
-	}
-	if got := parseModelFromBody([]byte(`not json`)); got != "-" {
+	if got := newChatStat(time.Now(), "", false, nil).model; got != "-" {
 		t.Errorf("got %q want -", got)
 	}
 }
@@ -297,10 +334,10 @@ func TestUIDPrefix(t *testing.T) {
 func TestLogChatRowFormat(t *testing.T) {
 	withChatLog(t)
 	out := captureStdout(t, func() {
-		logChatRow(412*time.Millisecond, 27100*time.Millisecond, "deepseek-v4-flash", "stream", "00e26541abcdef", "示例号", http.StatusOK, 1234)
+		logChatRow(412*time.Millisecond, 27100*time.Millisecond, "deepseek-v4-flash", "stream", "00e26541abcdef", "示例号", http.StatusOK, 1234, 8960, 197, true)
 	})
 	for _, want := range []string{
-		"| #", "deepseek-v4", "| stream |", "| 200 |", "示例号(00e26541)", "TTFB=412ms", "tok=1234", "tok/s   |", "total=",
+		"| #", "deepseek-v4", "| stream |", "| 200 |", "示例号(00e26541)", "TTFB=412ms", "tok=1234", "tok/s   |", "cache=97%", "total=",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("row missing %q:\n%s", want, out)
@@ -314,12 +351,27 @@ func TestLogChatRowFormat(t *testing.T) {
 func TestLogChatRowNoUsageShowsDash(t *testing.T) {
 	withChatLog(t)
 	out := captureStdout(t, func() {
-		logChatRow(0, time.Second, "glm-5.2", "sync", "s1", "", http.StatusServiceUnavailable, -1)
+		logChatRow(0, time.Second, "glm-5.2", "sync", "s1", "", http.StatusServiceUnavailable, -1, 0, 0, false)
 	})
-	for _, want := range []string{"TTFB=-", "tok=-", "tok=-      |", "| 503 |"} {
+	for _, want := range []string{"TTFB=-", "tok=-", "tok=-      |", "cache=-", "| 503 |"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("row missing %q:\n%s", want, out)
 		}
+	}
+}
+
+// 非流式行（无 TTFB 观测）：即便有 token 数也不报速率——分母只能是端到端耗时，
+// 里面混着预填，与流式行不可比（实测 35 万 token 提示的非流式请求只有 16~90 tok/s）。
+func TestLogChatRowNoRateWithoutTTFB(t *testing.T) {
+	withChatLog(t)
+	out := captureStdout(t, func() {
+		logChatRow(0, 9*time.Second, "glm-5.2", "sync", "u1", "", http.StatusOK, 100, 0, 0, false)
+	})
+	if !strings.Contains(out, "tok=100") {
+		t.Fatalf("行缺 token 数：\n%s", out)
+	}
+	if strings.Contains(out, "tok/s") {
+		t.Errorf("无 TTFB 观测不应报速率：\n%s", out)
 	}
 }
 
@@ -363,7 +415,7 @@ func TestLogChatRowSourceFields(t *testing.T) {
 func TestLogChatRowSourcePartial(t *testing.T) {
 	withChatLog(t)
 	out := captureStdout(t, func() {
-		logChatRow(0, time.Second, "m", "sync", "u", "", 200, 1)
+		logChatRow(0, time.Second, "m", "sync", "u", "", 200, 1, 0, 0, false)
 	})
 	if strings.Contains(out, "src=") {
 		t.Errorf("logChatRow has no source, want no src field:\n%s", out)
@@ -373,8 +425,8 @@ func TestLogChatRowSourcePartial(t *testing.T) {
 func TestLogChatRowSeqIncrements(t *testing.T) {
 	withChatLog(t)
 	out := captureStdout(t, func() {
-		logChatRow(0, time.Second, "m", "sync", "u", "", 200, 1)
-		logChatRow(0, time.Second, "m", "sync", "u", "", 200, 1)
+		logChatRow(0, time.Second, "m", "sync", "u", "", 200, 1, 0, 0, false)
+		logChatRow(0, time.Second, "m", "sync", "u", "", 200, 1, 0, 0, false)
 	})
 	lines := strings.Split(strings.TrimSpace(out), "\n")
 	if len(lines) != 2 {
@@ -452,11 +504,12 @@ func TestChatLogsErrorRow(t *testing.T) {
 		rec := httptest.NewRecorder()
 		req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`))
 		h.ServeHTTP(rec, req)
-		if rec.Code != 503 {
+		// 402 余额不足 → 硬冷却后无号轮转 → 积分耗尽语义（429 + insufficient_quota）。
+		if rec.Code != 429 {
 			t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
 		}
 	})
-	for _, want := range []string{"| u1 ", "| 503 |", "tok=-"} {
+	for _, want := range []string{"| u1 ", "| 429 |", "tok=-"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("error row missing %q:\n%s", want, out)
 		}
@@ -485,6 +538,75 @@ func TestHealthzDoesNotLogTableRow(t *testing.T) {
 	}
 }
 
+// 思考 token 单列（think=）：上游把思考算进 completion_tokens，不分开看就分不清
+// 「模型慢」和「模型在想」——Codex 这类高推理档流量的 completion 里思考占七到八成。
+// 上游没给该字段时保持旧行格式（不出现 think=）。
+func TestLogChatRowShowsThinkingTokens(t *testing.T) {
+	withChatLog(t)
+	out := captureStdout(t, func() {
+		logChatRowFull(1200*time.Millisecond, 8*time.Second, "deepseek-v4.1-flash", "stream",
+			"u123456789", "示例号", http.StatusOK, 1450, 1255, 0, 0, false,
+			"req-x", reqlog.OutcomeSuccess, 1, 0.02, true, "", "", 15*time.Millisecond, 1400*time.Millisecond, "high", "max", "")
+	})
+	if !strings.Contains(out, "tok=1450 think=1255") {
+		t.Errorf("row should show thinking tokens: %s", out)
+	}
+	// 分段耗时列（见 upstream.ChatTiming）：把 TTFB 拆成 prep/do 两段，未测量时不出现。
+	if !strings.Contains(out, "prep=15ms do=1400ms") {
+		t.Errorf("row should show prep/do split: %s", out)
+	}
+	// 生效思考档位列（issue #175/#43）：客户端要 max、实际发出去 high 时，
+	// 行里必须显示降级过程而不是只报生效值——只报生效值会被读成「客户端没发 max」。
+	if !strings.Contains(out, "effort=max->high") {
+		t.Errorf("row should show requested->effective reasoning effort: %s", out)
+	}
+	// 未降级（requested==effective）时不画箭头，保持旧行格式。
+	outSame := captureStdout(t, func() {
+		logChatRowFull(1200*time.Millisecond, 8*time.Second, "deepseek-v4.1-flash", "stream",
+			"u123456789", "示例号", http.StatusOK, 1450, 1255, 0, 0, false,
+			"req-y", reqlog.OutcomeSuccess, 1, 0.02, true, "", "", 15*time.Millisecond, 1400*time.Millisecond, "high", "high", "")
+	})
+	if !strings.Contains(outSame, "effort=high") || strings.Contains(outSame, "effort=high->") {
+		t.Errorf("same-tier row should show plain effort=high: %s", outSame)
+	}
+	out2 := captureStdout(t, func() {
+		logChatRow(1200*time.Millisecond, 8*time.Second, "deepseek-v4.1-flash", "stream",
+			"u123456789", "示例号", http.StatusOK, 1450, 0, 0, false)
+	})
+	if strings.Contains(out2, "effort=") {
+		t.Errorf("未携带档位的请求行不应出现 effort=: %s", out2)
+	}
+	if strings.Contains(out2, "think=") {
+		t.Errorf("think= 不该出现在没有该观测的行里: %s", out2)
+	}
+}
+
+// 思考 token 的**采集**（不只是行渲染）：上游两个字段形态都要认，都没有时 ok=false。
+// 为什么重要：Codex 这类高推理档流量的 completion_tokens 里思考占七到八成，采集不到就
+// 分不清「模型慢」与「模型在想」（本次排查的真问题）。
+func TestChatStatsReaderThinkingTokens(t *testing.T) {
+	// ① 顶层字段（实测形态：completion_thinking_tokens 与 completion_tokens_details 同时出现）
+	s := newChatStatsReaderSince(strings.NewReader(""), time.Now())
+	feedStatsLines(s,
+		`data: {"usage":{"prompt_tokens":66,"completion_tokens":100,"total_tokens":166,`+
+			`"completion_thinking_tokens":91,"completion_tokens_details":{"reasoning_tokens":91}}}`)
+	if n, ok := s.Thinking(); !ok || n != 91 {
+		t.Fatalf("thinking=%d ok=%v want 91/true（顶层字段）", n, ok)
+	}
+	// ② 只有嵌套字段时的回落
+	s2 := newChatStatsReaderSince(strings.NewReader(""), time.Now())
+	feedStatsLines(s2, `data: {"usage":{"completion_tokens":50,"completion_tokens_details":{"reasoning_tokens":40}}}`)
+	if n, ok := s2.Thinking(); !ok || n != 40 {
+		t.Fatalf("thinking=%d ok=%v want 40/true（嵌套回落）", n, ok)
+	}
+	// ③ 非推理响应：没有该字段 → ok=false（行里不出现 think=）
+	s3 := newChatStatsReaderSince(strings.NewReader(""), time.Now())
+	feedStatsLines(s3, `data: {"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`)
+	if n, ok := s3.Thinking(); ok || n != 0 {
+		t.Fatalf("thinking=%d ok=%v want 0/false（无该观测）", n, ok)
+	}
+}
+
 // 密钥标识必须落进流水行；未启用密钥体系（无身份）时不追加 key 段，旧格式不变。
 func TestLogChatRowKeyField(t *testing.T) {
 	withChatLog(t)
@@ -501,20 +623,5 @@ func TestLogChatRowKeyField(t *testing.T) {
 	})
 	if strings.Contains(legacy, "key=") {
 		t.Errorf("empty identity must not add key field:\n%s", legacy)
-	}
-}
-
-// 请求日志的 path 必须记录实际端点：/v1/responses 与 /v1/chat/completions 要分得开
-// （否则运行日志与归档里两种协议混在一起，排障时无法区分）。
-func TestRequestLogPathIsActualPath(t *testing.T) {
-	tr := &requestTrace{id: "r1", start: time.Now(), path: "/v1/responses"}
-	if got := tr.event(200).Path; got != "/v1/responses" {
-		t.Fatalf("path = %q，want /v1/responses", got)
-	}
-	// path 缺省（既有调用方/测试直接构造 requestTrace）时回落到 chat 路径，
-	// 保证既有行为与既有测试零漂移。
-	tr2 := &requestTrace{id: "r2", start: time.Now()}
-	if got := tr2.event(200).Path; got != "/v1/chat/completions" {
-		t.Fatalf("缺省 path = %q，want /v1/chat/completions", got)
 	}
 }

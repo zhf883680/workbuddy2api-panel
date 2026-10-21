@@ -5,6 +5,7 @@ package pool
 
 import (
 	"log"
+	"sort"
 	"strings"
 	"time"
 )
@@ -14,12 +15,13 @@ func (p *Pool) SetCredits(uid string, credits, total int64) {
 	defer p.mu.Unlock()
 	if e, ok := p.byUID[uid]; ok {
 		e.credits = credits
+		e.creditsRemainder = 0 // 权威余额整写：亚积分余量作废（同 SetCreditsDetailed）
 		e.creditsTotal = total
 		p.dirty.Store(true)
 	}
 }
 
-// SetNickname 更新账号昵称并回写 auths 凭证文件（issue #94：上游改名后同步）。
+// SetNickname 更新账号昵称并回写 auths 凭证文件（issue #94 同步：上游改名后同步）。
 // 昵称未变化时不写盘；uid 不存在 / 昵称为空返回 false。与 token 刷新共用
 // auth 自身的锁与 SaveAtomic 原子写，无半更新窗口。
 func (p *Pool) SetNickname(uid, nickname string) bool {
@@ -63,40 +65,107 @@ func (p *Pool) NoteCheckinDone(uid string) {
 	}
 }
 
-// SetCreditsDetailed 更新账号余额/总额、配置窗口内的快过架子集，以及最早未来
-// 到期批次。earliestAt 为零或不在未来时清空最早批次；expiring/earliestRemaining
-// 均钳到 [0, credits]，避免上游脏数据污染选号。
-func (p *Pool) SetCreditsDetailed(uid string, credits, total, expiring int64, earliestAt time.Time, earliestRemaining int64) {
+// CreditsSnapshot 一次余额查询的完整结果（含按日到期批次）。
+// 调度器/面板把 upstream.UserResourceSnapshot 的输出转换成本结构后写入池。
+type CreditsSnapshot struct {
+	Remain            int64
+	Total             int64
+	Expiring          int64
+	EarliestAt        time.Time
+	EarliestRemaining int64
+	ExpiryBuckets     []ExpiryBucket
+}
+
+// SetCreditsSnapshot 更新账号余额/总额、窗口内快过期子集、最早到期批次与按日到期批次。
+// 有 buckets 时以 buckets 为准重算最早批次（同一天多个包合计）；无 buckets 时沿用
+// 入参 earliestAt/earliestRemaining（兼容旧调用与测试）。所有数值钳到 [0, credits]，
+// 避免上游脏数据污染选号。
+func (p *Pool) SetCreditsSnapshot(uid string, s CreditsSnapshot) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if e, ok := p.byUID[uid]; ok {
-		if credits < 0 {
-			credits = 0
-		}
-		if expiring < 0 {
-			expiring = 0
-		}
-		if expiring > credits {
-			expiring = credits
-		}
-		now := time.Now()
-		if earliestRemaining < 0 {
-			earliestRemaining = 0
-		}
-		if earliestRemaining > credits {
-			earliestRemaining = credits
-		}
-		if earliestAt.IsZero() || !earliestAt.After(now) || earliestRemaining == 0 {
-			earliestAt = time.Time{}
-			earliestRemaining = 0
-		}
-		e.credits = credits
-		e.creditsTotal = total
-		e.creditsExpiring = expiring
-		e.creditsEarliestExpiry = earliestAt
-		e.creditsEarliestRemaining = earliestRemaining
-		p.dirty.Store(true)
+	e, ok := p.byUID[uid]
+	if !ok {
+		return
 	}
+	credits := s.Remain
+	if credits < 0 {
+		credits = 0
+	}
+	expiring := s.Expiring
+	if expiring < 0 {
+		expiring = 0
+	}
+	if expiring > credits {
+		expiring = credits
+	}
+	now := time.Now()
+	buckets := sanitizeExpiryBuckets(s.ExpiryBuckets, now)
+	earliestAt, earliestRemaining := s.EarliestAt, s.EarliestRemaining
+	if len(buckets) > 0 {
+		earliestAt = buckets[0].ExpireAt
+		earliestRemaining = buckets[0].Remain
+	}
+	if earliestRemaining < 0 {
+		earliestRemaining = 0
+	}
+	if earliestRemaining > credits {
+		earliestRemaining = credits
+	}
+	if earliestAt.IsZero() || !earliestAt.After(now) || earliestRemaining == 0 {
+		earliestAt = time.Time{}
+		earliestRemaining = 0
+	}
+	e.credits = credits
+	e.creditsRemainder = 0 // 权威余额整写：亚积分余量作废
+	e.creditsTotal = s.Total
+	e.creditsExpiring = expiring
+	e.creditsEarliestExpiry = earliestAt
+	e.creditsEarliestRemaining = earliestRemaining
+	e.expiryBuckets = buckets
+	p.dirty.Store(true)
+}
+
+// SetCreditsDetailed 旧入口：只有聚合余额与最早一批，没有按日批次。
+// 保留给测试与只关心最早批次的调用方；生产路径统一走 SetCreditsSnapshot。
+func (p *Pool) SetCreditsDetailed(uid string, credits, total, expiring int64, earliestAt time.Time, earliestRemaining int64) {
+	p.SetCreditsSnapshot(uid, CreditsSnapshot{
+		Remain:            credits,
+		Total:             total,
+		Expiring:          expiring,
+		EarliestAt:        earliestAt,
+		EarliestRemaining: earliestRemaining,
+	})
+}
+
+// sanitizeExpiryBuckets 深拷贝并清洗：只保留有日期、未过期、正剩余的桶，按日期升序。
+// ExpireAt 缺失时按日期补当天 00:00（本地时区），保证排序与最早批次仍可用。
+func sanitizeExpiryBuckets(in []ExpiryBucket, now time.Time) []ExpiryBucket {
+	if len(in) == 0 {
+		return nil
+	}
+	today := now.Format("2006-01-02")
+	out := make([]ExpiryBucket, 0, len(in))
+	for _, b := range in {
+		if b.Remain <= 0 || b.Date == "" || b.Date < today {
+			continue
+		}
+		if b.ExpireAt.IsZero() {
+			if t, err := time.ParseInLocation("2006-01-02", b.Date, time.Local); err == nil {
+				b.ExpireAt = t
+			}
+		}
+		if b.ExpireAt.IsZero() || !b.ExpireAt.After(now) {
+			continue
+		}
+		out = append(out, b)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Date != out[j].Date {
+			return out[i].Date < out[j].Date
+		}
+		return out[i].ExpireAt.Before(out[j].ExpireAt)
+	})
+	return out
 }
 
 // ClearExpiringSnapshots 清空所有账号的快过期/最早到期缓存。配置窗口改变时调用，
@@ -161,9 +230,9 @@ func (p *Pool) CooldownSoftForModel(uid string, base time.Duration, resetAt time
 				ResetAt: resetAt,
 				Reason:  reason,
 			}
-		} else {
-			// 无解析时间（普通软冷却）：有界退避（base 起按 softStreak 翻倍、封顶
-			// softRateMax）。注意：**在软冷却中**（until 未到期）时不推进/不延长。
+		} else if model == "" {
+			// 无模型名 → 无从「只停该模型」，退回账号级有界退避（现状语义）。
+			// 注意：**在软冷却中**（until 未到期）时不推进/不延长。
 			if e.coolKind != CoolSoft || !now.Before(e.until) {
 				d := p.softDurationLocked(base, e.softStreak+1)
 				e.softStreak++
@@ -172,15 +241,48 @@ func (p *Pool) CooldownSoftForModel(uid string, base time.Duration, resetAt time
 			e.coolKind = CoolSoft
 			e.reason = reason
 			clearRoutingModelCooldownsLocked(e)
+		} else {
+			// 无解析时间：把 **(号, 模型)** 停车，而不是整号冷却。
+			//
+			// 为什么必须模型级：6004/14003 的语义都是「这个模型忙/额度紧」，上游文案就是让
+			// 客户端换模型，实测同号换模型立刻可用。按账号冷却是把「一个模型抖动」放大成
+			// 「整池停摆」（线上事故：几个并发请求几十秒内冷掉十几个号 → 全站 503）。
+			// TTL 沿用 soft_rate 家族（base 起按 hits 翻倍、封顶 soft_rate_max），
+			// 与「带解析时间」分支同表（modelCooldowns），面板台账自动可见。
+			// ponytail: 成功调用不提前清这条（只按 TTL 到期）；实测同一 (号,模型) 被反复
+			// 停车再加重试期间清除逻辑。
+			if e.modelCooldowns == nil {
+				e.modelCooldowns = map[string]modelCooldown{}
+			}
+			hits := e.modelCooldowns[model].Hits + 1
+			e.modelCooldowns[model] = modelCooldown{
+				Until:  now.Add(p.softDurationLocked(base, hits)),
+				Reason: reason,
+				Hits:   hits,
+			}
 		}
 		p.dirty.Store(true)
 	}
 }
 
-// RecordModelRateLimitAudit 记录无法参与模型路由的 6004 展示项。
-// 典型场景是 6004 没有可解析重置时间：账号仍按原有有界退避冷却，
-// 本方法只把模型名挂到 e.until 上供账号页展示，不影响 healthyForModel。
-func (p *Pool) RecordModelRateLimitAudit(uid, model, reason string) {
+// modelBusyBase/modelBusyMax 14003「模型繁忙」的独立停车窗口。
+//
+// 不复用 soft_rate 家族：那套阶梯（默认 600s 起、按命中翻倍、封顶 2h）是给
+// 「这个账号/模型被持续限流」准备的，惩罚一次瞬时抖动代价过高。14003 的
+// displayMsg 就是「模型繁忙，请换模型或稍后重试」，60s 足够让上游窗口滑过去；
+// 同一 (号, 模型) 反复命中再翻倍，但封顶 3 分钟——宁可多换一次号，也不要把
+// 一个忙碌模型停成十分钟不可用。
+const (
+	modelBusyBase = 60 * time.Second
+	modelBusyMax  = 3 * time.Minute
+)
+
+// CooldownModelBusy 把 (账号, 模型) 停一个短窗口（14003 模型繁忙专用）。
+//
+//   - 只写 modelCooldowns[model]，不碰账号级 until：同号换模型立即可用。
+//   - 同一窗口内重复命中不延长（并发请求/兜底探测不得把 60s 堆成分钟级）。
+//   - 已有更晚的冷却（6004 墙钟 / 11102 负缓存）时保留原截止，不缩短。
+func (p *Pool) CooldownModelBusy(uid, model, reason string) {
 	if uid == "" || model == "" {
 		return
 	}
@@ -191,20 +293,24 @@ func (p *Pool) RecordModelRateLimitAudit(uid, model, reason string) {
 		return
 	}
 	now := time.Now()
-	if old, exists := e.modelCooldowns[model]; exists && !old.AuditOnly && old.Until.After(now) {
-		return // 已有真实模型冷却，审计记录不得覆盖路由截止
-	}
-	until := e.until
-	if until.IsZero() || !until.After(now) {
-		until = now.Add(p.softRateMaxOr())
+	if old, exists := e.modelCooldowns[model]; exists && old.Until.After(now) {
+		return
 	}
 	if e.modelCooldowns == nil {
-		e.modelCooldowns = make(map[string]modelCooldown)
+		e.modelCooldowns = map[string]modelCooldown{}
+	}
+	hits := e.modelCooldowns[model].Hits + 1
+	d := modelBusyBase
+	for i := 1; i < hits && d < modelBusyMax; i++ {
+		d *= 2
+	}
+	if d > modelBusyMax {
+		d = modelBusyMax
 	}
 	e.modelCooldowns[model] = modelCooldown{
-		Until:     until,
-		Reason:    reason,
-		AuditOnly: true,
+		Until:  now.Add(d),
+		Reason: reason,
+		Hits:   hits,
 	}
 	p.dirty.Store(true)
 }
@@ -273,10 +379,9 @@ func (p *Pool) BlockModelBackoff(uid, model, reason string) {
 	p.dirty.Store(true)
 }
 
-// BlockModelClear 清除 (账号, 模型) 的 11102 负缓存条目（该模型实测又通了）。半开探测
-// 或正常请求对该模型成功后调用（handler 成功路径）。只清 11102 条目、不碰 6004 独立
-// 冷却表——6004 有自身上游重置墙钟语义，成功不该抹掉。reason 前缀判定区分两者：
-// 11102 条目的 reason 恒以 "11102" 开头（见 upstream.BlockModelReason）。
+// BlockModelClear 清除 (账号, 模型) 的确定性模型拒绝负缓存（11102/11158；该模型
+// 实测又通了）。半开探测或正常请求对该模型成功后调用（handler 成功路径）。只清
+// 这两类条目、不碰 6004 独立冷却表——6004 有自身上游重置墙钟语义，成功不该抹掉。
 func (p *Pool) BlockModelClear(uid, model string) {
 	if uid == "" || model == "" {
 		return
@@ -288,7 +393,7 @@ func (p *Pool) BlockModelClear(uid, model string) {
 		return
 	}
 	mc, exists := e.modelCooldowns[model]
-	if !exists || !strings.HasPrefix(mc.Reason, "11102") {
+	if !exists || (!strings.HasPrefix(mc.Reason, "11102") && !strings.HasPrefix(mc.Reason, "11158")) {
 		return
 	}
 	delete(e.modelCooldowns, model)
@@ -306,13 +411,13 @@ type ModelBlockStatus struct {
 	Count   int       // 因此被挡的账号数
 }
 
-// ModelBlocked 报告该模型是否在全池范围内被模型级冷却挡住。
+// ModelBlocked 报告该模型是否在全池范围内被模型级冷却挡住。（吸收上游 44d6e04）
 //
 // 为什么需要它：选号失败时客户端只会拿到 no_healthy_account（"没有可用账号"），
 // 但真实原因常常是「号都在、只是都对这个模型关闭」。两者对调用方的处置完全不同
 // ——前者该等，后者换个模型才有用——此前却无法区分：首次请求还能看到上游原文
-// （lastErr 非空），一旦负缓存写入，后续请求 lastErr 为空，就只剩"池子没号"
-// （issue #102 附带发现 1）。上游原文与解封时间在那里被丢掉。
+// （lastErr 非空），一旦负缓存写入，后续请求 lastErr 为空，就只剩"池子没号"。
+// 上游原文与解封时间在那里被丢掉。
 //
 // 跨 realm 判定：调用方失败前已依次尝试过各域，所以只要有**任意**账号还能服务该
 // 模型，就不能算全池阻塞 —— 此时返回 Blocked=false，让上层继续用原有的
@@ -321,6 +426,13 @@ type ModelBlockStatus struct {
 // 口径必须与选号一致：用 modelCooled 而非直接查 map，这样 AuditOnly 条目
 // （只审计不拦截）不会被误报成阻塞。
 func (p *Pool) ModelBlocked(model string) ModelBlockStatus {
+	return p.ModelBlockedForRealm(model, "")
+}
+
+// ModelBlockedForRealm 与 ModelBlocked 同口径，但只统计指定 realm 的可选账号。
+// 模型请求已按 realm 分池时（如 global:gpt-5.6-sol 只走 global 账号），另一域的
+// 未冷却账号不构成“还能服务”的证明，否则会把本域全锁误报成 no_healthy_account。
+func (p *Pool) ModelBlockedForRealm(model, realm string) ModelBlockStatus {
 	if model == "" {
 		return ModelBlockStatus{}
 	}
@@ -330,6 +442,11 @@ func (p *Pool) ModelBlocked(model string) ModelBlockStatus {
 
 	var st ModelBlockStatus
 	for _, e := range p.byUID {
+		// 命中 realm 之外的账号、以及禁用/暂停号，都不构成「还能服务」的证明：
+		// realm 分池后另一域的健康号掩盖不了本域全锁。
+		if realm != "" && e.a.Realm() != realm {
+			continue
+		}
 		// 暂停选号（paused）号与禁用号同口径跳过：它此刻不可选，「能服务」的
 		// 证明不成立——否则一个暂停的健康号会掩盖「其余号全被模型级冷却挡住」。
 		if e.disabled || e.paused {

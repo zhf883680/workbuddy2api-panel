@@ -18,15 +18,21 @@ func TestAddAndTotals(t *testing.T) {
 	// 上游没给 total 时用 pt+ct 兜底，保证总量口径连续。
 	r.Add(now, "cn", "uid1", "glm-5.2", Delta{PromptTokens: 10, HasPromptTokens: true, CompletionTokens: 5, HasCompletion: true}, true)
 
+	// 缓存命中/未命中随桶累计，并出现在按账号/按模型的聚合行里（面板命中率列的来源）。
+	r.Add(now, "cn", "uid1", "glm-5.2", Delta{CacheHitTokens: 8960, CacheMissTokens: 197, HasCache: true}, true)
+
 	s := r.Snapshot(24, nil)
-	if s.Totals.Requests != 3 || s.Totals.Errors != 1 {
-		t.Fatalf("requests/errors = %d/%d, want 3/1", s.Totals.Requests, s.Totals.Errors)
+	if s.Totals.Requests != 4 || s.Totals.Errors != 1 {
+		t.Fatalf("requests/errors = %d/%d, want 4/1", s.Totals.Requests, s.Totals.Errors)
 	}
 	if s.Totals.PromptTokens != 110 || s.Totals.CompletionTok != 55 {
 		t.Fatalf("pt/ct = %d/%d, want 110/55", s.Totals.PromptTokens, s.Totals.CompletionTok)
 	}
 	if s.Totals.TotalTokens != 165 {
 		t.Fatalf("tt = %d, want 165（无 total 时按 pt+ct 兜底）", s.Totals.TotalTokens)
+	}
+	if s.Totals.CacheHitTok != 8960 || s.Totals.CacheMissTok != 197 {
+		t.Fatalf("cache = %d/%d, want 8960/197", s.Totals.CacheHitTok, s.Totals.CacheMissTok)
 	}
 	if s.Totals.Credits != 1.5 || s.Totals.CreditSamples != 1 || s.Totals.CreditTokens != 150 || s.Totals.CreditsPer1MTokens != 10000 {
 		t.Fatalf("credit totals = %+v, want credits=1.5 samples=1 tokens=150 ratio=10000", s.Totals)
@@ -44,9 +50,9 @@ func TestAddAndTotals(t *testing.T) {
 		s.CreditByAccount[0].CreditSamples != 1 || s.CreditByAccount[0].CreditsPer1MTokens != 10000 {
 		t.Fatalf("credit_by_account = %+v, want one uid1 row", s.CreditByAccount)
 	}
-	if len(s.CreditByModel) != 1 || s.CreditByModel[0].Key != "glm-5.2" ||
+	if len(s.CreditByModel) != 1 || s.CreditByModel[0].Key != "cn:glm-5.2" ||
 		s.CreditByModel[0].Rate != "0.05" || s.CreditByModel[0].CreditsPer1MTokens != 10000 {
-		t.Fatalf("credit_by_model = %+v, want one glm-5.2 rate=0.05 row", s.CreditByModel)
+		t.Fatalf("credit_by_model = %+v, want one cn:glm-5.2 rate=0.05 row", s.CreditByModel)
 	}
 }
 
@@ -135,7 +141,7 @@ func TestCreditSurvivesRollup(t *testing.T) {
 	}
 }
 
-// 模型维度按“裸模型名 + 生效倍率”合并；同倍率跨账号/时间合并，不同倍率拆行。
+// 模型维度按“域:模型 + 生效倍率”合并；同倍率跨账号/时间合并，不同倍率拆行。
 func TestCreditDimensionsRateGrouping(t *testing.T) {
 	r := New("")
 	now := time.Now()
@@ -147,12 +153,33 @@ func TestCreditDimensionsRateGrouping(t *testing.T) {
 	if len(s.CreditByAccount) != 2 || len(s.CreditByModel) != 2 {
 		t.Fatalf("dimensions accounts=%+v models=%+v, want 2 accounts and 2 model-rate rows", s.CreditByAccount, s.CreditByModel)
 	}
-	if s.CreditByModel[0].Key != "glm-5.2" || s.CreditByModel[0].Rate != "0.8" ||
+	if s.CreditByModel[0].Key != "cn:glm-5.2" || s.CreditByModel[0].Rate != "0.8" ||
 		s.CreditByModel[0].Credits != 6 || s.CreditByModel[0].CreditTokens != 300 {
 		t.Fatalf("first model row = %+v, want rate=0.8 credits=6 tokens=300", s.CreditByModel[0])
 	}
 	if s.CreditByModel[1].Rate != "0.5" || s.CreditByModel[1].Credits != 3 || s.CreditByModel[1].CreditTokens != 300 {
 		t.Fatalf("merged model row = %+v, want rate=0.5 credits=3 tokens=300", s.CreditByModel[1])
+	}
+}
+
+// 同名模型跨域不合并：cn / global 的倍率与实扣是两笔账，行键带域前缀（面板「按模型」
+// 列显示的就是 cn:/global:）。此前按裸模型名聚合，两域被并成一行、也看不出行属哪个域。
+func TestCreditModelRowsSplitByRealm(t *testing.T) {
+	r := New("")
+	now := time.Now()
+	r.Add(now, "cn", "u1", "glm-5.2", Delta{TotalTokens: 100, HasTotal: true, Credit: 1, HasCredit: true, ModelRate: "0.5"}, true)
+	r.Add(now, "global", "g1", "glm-5.2", Delta{TotalTokens: 100, HasTotal: true, Credit: 2, HasCredit: true, ModelRate: "0.5"}, true)
+
+	s := r.Snapshot(24, nil)
+	if len(s.CreditByModel) != 2 {
+		t.Fatalf("credit_by_model = %+v, want 2 rows（同倍率的 cn / global 也不合并）", s.CreditByModel)
+	}
+	got := map[string]float64{}
+	for _, row := range s.CreditByModel {
+		got[row.Key] = row.Credits
+	}
+	if got["cn:glm-5.2"] != 1 || got["global:glm-5.2"] != 2 {
+		t.Fatalf("rows = %+v, want cn:glm-5.2=1 global:glm-5.2=2", s.CreditByModel)
 	}
 }
 
@@ -303,53 +330,35 @@ func TestLifecycleFlush(t *testing.T) {
 	}
 }
 
-// TestCacheHitRateAccumulation（issue #92）：桶累计 hit/miss，credit_by_model
-// 与 totals 输出命中率；无缓存观测的桶不参与（rate 零值省略）。
-func TestCacheHitRateAccumulation(t *testing.T) {
-	r := New(t.TempDir() + "/usage.json")
-	base := time.Date(2026, 10, 1, 10, 0, 0, 0, time.Local)
-	r.Add(base, "cn", "u1", "glm-5.3", Delta{
-		PromptTokens: 1000, HasPromptTokens: true,
-		Credit: 1, HasCredit: true, TotalTokens: 1005, HasTotal: true,
-		HasCacheTokens: true, CacheHitTokens: 900, CacheMissTokens: 100,
-	}, true)
-	r.Add(base.Add(time.Minute), "cn", "u1", "glm-5.3", Delta{
-		PromptTokens: 1000, HasPromptTokens: true,
-		Credit: 2, HasCredit: true, TotalTokens: 1004, HasTotal: true,
-		HasCacheTokens: true, CacheHitTokens: 100, CacheMissTokens: 900,
-	}, true)
-	snap := r.Snapshot(0, nil)
-	if got := snap.CreditByModel[0].CacheHitRate; got != 50 {
-		t.Fatalf("cache_hit_rate=%v want 50", got)
+// 积分历史：扣费积分按桶累计、进聚合（卡片与按小时表的来源），
+// 且小时桶折叠成日桶时不能把积分丢掉（丢了就是"看历史漏掉大半"）。
+// 没观测到 credit 的请求（HasCredit=false）不参与——"没测到"≠"没花钱"。
+func TestCreditsAggregateAndSurviveRollup(t *testing.T) {
+	r := New("")
+	now := time.Now()
+	old := now.AddDate(0, 0, -100) // 超出 90 天小时保留 → 会被折叠成日桶
+
+	r.Add(now, "cn", "u", "m", Delta{TotalTokens: 100, HasTotal: true, Credit: 1.5, HasCredit: true}, true)
+	r.Add(now, "cn", "u", "m", Delta{TotalTokens: 100, HasTotal: true, Credit: 0.5, HasCredit: true}, true)
+	r.Add(now, "cn", "u", "m", Delta{TotalTokens: 100, HasTotal: true}, true) // 没观测到 credit：不计
+	r.Add(old, "cn", "u", "m", Delta{TotalTokens: 200, HasTotal: true, Credit: 4, HasCredit: true}, true)
+
+	win := r.Snapshot(24, nil)
+	if win.Totals.Credits != 2 {
+		t.Fatalf("窗口内积分 = %v, want 2（未观测到的不计）", win.Totals.Credits)
 	}
-	if snap.Totals.CacheHitRate != 50 {
-		t.Fatalf("totals cache_hit_rate=%v want 50", snap.Totals.CacheHitRate)
-	}
-	if snap.CreditByModel[0].CacheHitTokens != 1000 || snap.CreditByModel[0].CacheMissTokens != 1000 {
-		t.Fatalf("hit/miss 累计错误: %+v", snap.CreditByModel[0])
+	if len(win.Series) != 1 || win.Series[0].Credits != 2 {
+		t.Fatalf("窗口内小时点积分 = %+v, want 2", win.Series)
 	}
 
-	// 无缓存观测的桶：rate 零值。
-	r2 := New(t.TempDir() + "/usage2.json")
-	r2.Add(base, "cn", "u1", "m", Delta{PromptTokens: 10, HasPromptTokens: true, Credit: 1, HasCredit: true, TotalTokens: 12, HasTotal: true}, true)
-	if got := r2.Snapshot(0, nil).CreditByModel[0].CacheHitRate; got != 0 {
-		t.Fatalf("无缓存观测应 rate=0, got %v", got)
+	r.Rollup(now)
+	all := r.Snapshot(0, nil)
+	if all.Totals.Credits != 6 {
+		t.Fatalf("折叠后全历史积分 = %v, want 6（4 分来自日桶）", all.Totals.Credits)
 	}
-}
-
-// TestCacheTokensPersistRoundtrip：ch/cm 落盘 v4 并无损恢复。
-func TestCacheTokensPersistRoundtrip(t *testing.T) {
-	dir := t.TempDir()
-	r := New(dir + "/usage.json")
-	base := time.Date(2026, 10, 1, 10, 0, 0, 0, time.Local)
-	r.Add(base, "cn", "u1", "m", Delta{
-		Credit: 1, HasCredit: true, TotalTokens: 100, HasTotal: true,
-		HasCacheTokens: true, CacheHitTokens: 75, CacheMissTokens: 25,
-	}, true)
-	r.Save()
-	r2 := New(dir + "/usage.json")
-	snap := r2.Snapshot(0, nil)
-	if snap.CreditByModel[0].CacheHitRate != 75 {
-		t.Fatalf("恢复后 cache_hit_rate=%v want 75", snap.CreditByModel[0].CacheHitRate)
+	for _, p := range all.Series {
+		if p.Scope == "day" && p.Credits != 4 {
+			t.Fatalf("日点积分 = %v, want 4", p.Credits)
+		}
 	}
 }

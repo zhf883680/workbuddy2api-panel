@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/loginlock"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/prompt"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/safefile"
 )
 
 // Config 顶层配置。
@@ -26,6 +28,11 @@ type Config struct {
 	// 密钥是运行期数据（面板随时增删改），与 config.json 的人改配置分离：
 	// 走独立的原子读写，不受配置保存链路影响。
 	KeysFile string `json:"keys_file"`
+
+	// DNSServers 出站解析用的 DNS 服务器（空 = 用系统解析器）；也可用 WB2A_DNS 覆盖
+	// （逗号分隔）。给没有 /etc/resolv.conf 的环境用：Android 上 Go 的解析器会退回
+	// [::1]:53，所有域名解析直接失败；本地 DNS 被污染时也可借此直连可信解析器。
+	DNSServers []string `json:"dns_servers,omitempty"`
 
 	Panel struct {
 		// PackageDetailLimit 积分构成页单账号默认展示的最近到期包数；<=0 回落 5。
@@ -94,8 +101,8 @@ type Config struct {
 		ActivityHours  []int `json:"activity_hours"`  // [10]
 		KeepaliveHours []int `json:"keepalive_hours"` // [22]
 		BlackcatHours  []int `json:"blackcat_hours"`  // [23] 夜猫子窗口（23:00–08:00 计数）
-		GrowthHours    []int `json:"growth_hours"`    // [1] 成长任务队列（Sequential 族每日零点解锁，01:00 自动扫描执行）
-		// CheckinEnabled/TravelEnabled/ActivityEnabled/KeepaliveEnabled/BlackcatEnabled 显式禁用开关（缺省 true）。
+		GrowthHours    []int `json:"growth_hours"`    // [11] 成长任务队列（任务中心待办）自动执行
+		// CheckinEnabled/TravelEnabled/ActivityEnabled/KeepaliveEnabled/BlackcatEnabled/GrowthEnabled 显式禁用开关（缺省 true）。
 		//
 		// 为什么用独立 bool 而不是空数组/哨兵值表意"禁用"：
 		//   - 空数组与 null 在老语义里已被"未配置 → 回落默认"占用，改判会静默翻转
@@ -109,16 +116,15 @@ type Config struct {
 		ActivityEnabled  bool `json:"activity_enabled"`  // 缺省 true；false = 停活跃上报
 		KeepaliveEnabled bool `json:"keepalive_enabled"` // 缺省 true；false = 关 token 保活
 		BlackcatEnabled  bool `json:"blackcat_enabled"`  // 缺省 true；false = 关夜猫子
-		GrowthEnabled    bool `json:"growth_enabled"`    // 缺省 true；false = 关成长任务自动排程
+		GrowthEnabled    bool `json:"growth_enabled"`    // 缺省 true；false = 关成长任务队列
 
 		// IncludeDisabledInTasks 让「保号类」定时任务（签到 / 活跃上报 / token 保活 /
 		// 余额刷新）对**已禁用（disabled）**的账号也执行。
 		//
-		// 为什么需要它：面板「禁用」的语义是「不再参与选号」（见面板确认文案），但这四类
-		// 任务此前一律 `if st.Disabled { continue }`，等于把「停用流量」放大成「停止一切
-		// 上游保号行为」——被禁用的号拿不到签到积分、不续 token、余额也不再刷新；而
-		// ReenableIfCredits 明确不复活 disabled 账号（见 pool.state.go），于是签到这条唯一
-		// 的自动回血路径也断了，账号只能靠人工「解冻」回来。
+		// 为什么需要它：面板「禁用」的语义是「不再参与选号」，但这四类任务此前一律
+		// `if st.Disabled { continue }`，等于把「停用流量」放大成「停止一切上游保号行为」
+		// ——被禁用的号拿不到签到积分、不续 token、余额也不再刷新；而 ReenableIfCredits
+		// 明确不复活 disabled 账号，于是签到这条唯一的自动回血路径也断了。
 		//
 		// 对「一次只放开一个号、用禁用做流量开关」的轮换用法（同 IP 多号防风控），闲置
 		// 待命的号恰恰是最需要签到的那批——本开关即为该用法提供出口。
@@ -126,11 +132,22 @@ type Config struct {
 		// 缺省 false = 保持既有行为，对老配置零影响。打开后禁用号仍会签到 / 保活，但
 		// **依旧不参与选号**：pool 选号侧的 disabled 过滤不受本开关影响。
 		IncludeDisabledInTasks bool `json:"include_disabled_in_tasks"`
+		// GrowthConcurrency 排程轮次的账号间并发（缺省 1，上限 4）：与面板手动
+		// 「执行队列」同一个并发语义；调高更快的代价是上游风控暴露面。
+		GrowthConcurrency int `json:"growth_concurrency"`
+		// JitterMinutes 0 = 精确整点。正值把触发时刻摊在该窗口内，同一小时偏移固定。
+		JitterMinutes int `json:"jitter_minutes"`
 
 		// 余额后台周期刷新：两次签到时点之间 credits 也能保持新鲜（面板/状态观测用）。
 		// 解冻语义同签到（余额 > 0 的冷却账号自动解冻），但不做签到不刷 token。
 		BalanceRefreshEnabled bool `json:"balance_refresh_enabled"` // 缺省 true；false = 关闭
 		BalanceRefreshMinutes int  `json:"balance_refresh_minutes"` // 缺省 5；<=0 回落 5
+
+		// 补领清扫（issue #174）：周期把「已达标未领」的任务领掉、把「待接受」的接受掉，
+		// 不跑任何行为链路。补的是新号自动跑当时还没达标（awaiting_progress）与
+		// autoActions 白名单外的任务——它们此前除了手动一键完成没有任何补领路径。
+		TaskSweepEnabled bool `json:"task_sweep_enabled"` // 缺省 true；false = 关闭
+		TaskSweepMinutes int  `json:"task_sweep_minutes"` // 缺省 15；<=0 回落 15
 	} `json:"schedule"`
 
 	Global struct {
@@ -145,6 +162,15 @@ type Config struct {
 		ChatBase    string `json:"chat_base"`
 		BillingBase string `json:"billing_base"`
 	} `json:"global"`
+
+	CN struct {
+		// ChatBase 国内版 chat/模型目录上游 base 覆盖；空 = 回落内置默认
+		// https://copilot.tencent.com（internal/upstream.New 的 ChatBaseCN）。
+		// copilot.tencent.com 对海外出口（如 Clash 全局 + TUN）的 TLS 握手直接复位，
+		// CN 模型目录与对话全部 EOF；官方 WorkBuddy 桌面端已改用 https://www.workbuddy.cn，
+		// 该域海外出口可达，/v2/chat/completions、/v3/config 与模型目录路径同构。
+		ChatBase string `json:"chat_base"`
+	} `json:"cn"`
 
 	Upstream struct {
 		// TimeoutSeconds 短 RPC（refresh/checkin/balance/FetchModels）总时长上限，默认 120。
@@ -172,12 +198,30 @@ type Config struct {
 		DeviceTokenFile string `json:"device_token_file"`
 		// PassthroughIP 是否透传客户端 IP 给上游（默认 false，反代安全边界）。
 		PassthroughIP bool `json:"passthrough_ip"`
+		// DumpDir 非空时把 chat 请求的出站报文 + 上游原始响应落盘（诊断用，见
+		// internal/upstream/dump.go）。默认空 = 不落盘：正文含用户提示词。
+		DumpDir string `json:"dump_dir"`
 	} `json:"upstream"`
 
 	Features struct {
 		// SanitizeBlacklistFingerprints 出站请求体黑名单指纹脱敏（默认 true；false 完全还原）。
 		SanitizeBlacklistFingerprints bool `json:"sanitize_blacklist_fingerprints"`
 	} `json:"features"`
+
+	Models struct {
+		// Hidden 不对外暴露的模型黑名单。裸名=两域都藏；"cn:xxx"/"global:xxx"=只藏该域。
+		// 生效点：GET /v1/models 列表过滤 + POST /v1/chat/completions 点名拒绝
+		// （只藏列表不够——知道名字仍可硬调）。面板保存后经 livecfg 热生效，无需重启。
+		Hidden []string `json:"hidden"`
+		// Aliases 模型映射表（issue #30）："客户端名=真实模型名" 条目数组，与 Hidden
+		// 同存储形态（数组整体覆盖，面板删条目无需重启）。键：裸名=两域生效，
+		// "cn:x"/"global:x"=只在该域生效；键大小写不敏感。值可带 realm 前缀实现跨域
+		// 指向（"my-glm": "global:glm-5.2"）。生效点：chat 请求解析 realm/裸名之后、
+		// 隐藏检查/选号/出站 body 之前整体替换；被映射到的目标仍受 Hidden 约束
+		// （别名不能绕过黑名单）。响应/日志/账本按实际生效模型名口径。
+		// 面板保存后经 livecfg 热生效，无需重启。
+		Aliases []string `json:"aliases"`
+	} `json:"models"`
 
 	Prompt struct {
 		// Mode passthrough（默认）= 透传客户端原始 system（降级重试仍会切到 Degraded）；
@@ -225,11 +269,31 @@ type Config struct {
 		// 错误策略）。默认 "30m"（≤48 次/天/模型）；"0" 关停（完全回到现状行为）；
 		// 空值回落默认。
 		CostExploreInterval string `json:"cost_explore_interval"`
+		// ReserveCredits 保留积分阈值：余额已知且 <= 该值的账号停止接单（仍在池中、
+		// 照常跑定时任务，充值后自动恢复）。上游余额耗尽会发提醒短信，设阈值即避免
+		// 被用到 0。未配置（键缺席）→ 默认 10；显式写 0 = 关闭；从未查到余额的账号不受影响。
+		// 指针类型用于区分「未配置」（nil → 默认 10）与「显式 0」（关闭）。
+		ReserveCredits *int64 `json:"reserve_credits"`
+		// AccountPriority / AccountShare 账号级路由偏好（issue #62）。键 = uid（面板账号
+		// 行的短 uid，悬停看完整值）。缺省/空表 = 全部未配置，选号行为与旧版完全一致。
+		//   account_priority: {"<uid>": 1} 小 = 先消耗。配了的号构成「先烧层」，层内号
+		//     可用时其余号不接单；层内号烧空/冷却/停牌后自动让位给下一层。
+		//   account_share: {"<uid>": 70, "<uid2>": 30} 同层内按归一化比例分流量
+		//     （70/30 与 7/3 同义，不必凑满 100）。**优先于 prefer_expiring**：配了占比
+		//     的号独占本层流量，到期优先只对没配占比的号生效。
+		// 非正值（priority ≤ 0 / share ≤ 0）由校验剔除，等价于未配置。
+		AccountPriority map[string]int     `json:"account_priority"`
+		AccountShare    map[string]float64 `json:"account_share"`
 		// CreditFloor 积分保底：账号余额低于该值时，对实测收费模型（tier 2）不再
 		// 参与选号——防止收费请求把余额打穿、连免费模型都 402 冷却到次日签到。
-		// tier 0（免费）/ tier 1（无观测）不受限；签到回血越过 floor 自动恢复。
-		// 默认 0 = 关闭；负值钳 0。
+		// tier 0（免费）不受限；tier 1（无观测）按目录倍率分档：≤ 下面的
+		// CreditFloorMaxRate 放行（让便宜新模型跑出第一笔账本），更高的仍拦。
+		// 签到回血越过 floor 自动恢复。默认 0 = 关闭；负值钳 0。
 		CreditFloor int64 `json:"credit_floor"`
+		// CreditFloorMaxRate 保底兜底允许的目录倍率上限（issue #30 / PR #2）。
+		// 0.2 = 便宜模型（x0.11 这类）在触底号上放行入账，x1.62 这类仍按收费拦。
+		// 0 = 严格模式（任何已知正倍率都拦）；负值钳 0。面板「积分保底」档位旁可改。
+		CreditFloorMaxRate float64 `json:"credit_floor_max_rate"`
 	} `json:"pool"`
 
 	SessionSticky struct {
@@ -237,6 +301,39 @@ type Config struct {
 		TTL        string `json:"ttl"`         // 会话绑定 TTL，默认 "30m"
 		GCInterval string `json:"gc_interval"` // 会话 GC 周期，默认 "5m"
 	} `json:"session_sticky"`
+
+	// Jitter 在 schedule 里。下面几段缺省关闭，旧配置行为不变。
+	Admin struct {
+		Enabled      bool   `json:"enabled"`
+		AuditEnabled bool   `json:"audit_enabled"`
+		AuditFile    string `json:"audit_file"`
+	} `json:"admin"`
+	Metrics struct {
+		Enabled bool `json:"enabled"`
+	} `json:"metrics"`
+	Alerting struct {
+		Enabled             bool   `json:"enabled"`
+		WebhookURL          string `json:"webhook_url"`
+		Secret              string `json:"secret"`
+		IntervalSeconds     int    `json:"interval_seconds"`
+		TimeoutSeconds      int    `json:"timeout_seconds"`
+		StartupGraceSeconds int    `json:"startup_grace_seconds"`
+		MinHealthyCN        int    `json:"min_healthy_cn"`
+		MinHealthyGlobal    int    `json:"min_healthy_global"`
+		RecoverHealthy      int    `json:"recover_healthy"`
+		BreakerThreshold    int    `json:"breaker_threshold"`
+		ForTicks            int    `json:"for_ticks"`
+		ClearTicks          int    `json:"clear_ticks"`
+		SendResolve         bool   `json:"send_resolve"`
+	} `json:"alerting"`
+	Budget struct {
+		DailyCreditLimit float64 `json:"daily_credit_limit"` // 0 = 不限
+		// BurstCreditLimit 5 分钟窗口内累计 credit 达此值即拒绝（0 = 关闭）。
+		// issue #229：高倍率模型 140k 上下文一次 20+ 积分，日上限止血太慢。
+		BurstCreditLimit float64 `json:"burst_credit_limit"`
+		// CacheLowRate 连续 5 轮缓存命中率低于此百分比即冷却 60s（0 = 关闭）。
+		CacheLowRate float64 `json:"cache_low_rate"`
+	} `json:"budget"`
 
 	// 解析后
 	SoftRateDur            time.Duration `json:"-"`
@@ -248,6 +345,7 @@ type Config struct {
 	SessionTTL             time.Duration `json:"-"`
 	SessionGCInterval      time.Duration `json:"-"`
 	BalanceRefreshInterval time.Duration `json:"-"` // 0 = 不启动（enabled=false）
+	TaskSweepInterval      time.Duration `json:"-"` // 0 = 不启动（task_sweep_enabled=false）
 	ExpiringSoonDur        time.Duration `json:"-"`
 	// CostExploreIntervalDur 解析后的 costTier 探索窗口（issue #136）；0 = 关停。
 	CostExploreIntervalDur time.Duration `json:"-"`
@@ -287,17 +385,19 @@ func Default() *Config {
 	c.Schedule.ActivityHours = []int{10}
 	c.Schedule.KeepaliveHours = []int{22}
 	c.Schedule.BlackcatHours = []int{23}
-	c.Schedule.GrowthHours = []int{1}
+	c.Schedule.GrowthHours = []int{11}
 	// 开关「缺省 true」靠这几行实现：Load 先取 Default() 再 json.Unmarshal 覆盖，
 	// 键缺席（或为 null）时字段原样保留 true，只有显式 false 才关。
 	c.Schedule.CheckinEnabled = true
-	c.Schedule.GrowthEnabled = true
 	c.Schedule.TravelEnabled = true
 	c.Schedule.ActivityEnabled = true
 	c.Schedule.KeepaliveEnabled = true
 	c.Schedule.BlackcatEnabled = true
+	c.Schedule.GrowthEnabled = true
 	c.Schedule.BalanceRefreshEnabled = true
 	c.Schedule.BalanceRefreshMinutes = 5
+	c.Schedule.TaskSweepEnabled = true
+	c.Schedule.TaskSweepMinutes = 15
 	c.Upstream.TimeoutSeconds = 120
 	// HeaderTimeoutSeconds/IdleTimeoutSeconds 默认 0（未设置态），回落见 normalize()。
 	c.Upstream.HeaderTimeoutSeconds = 0
@@ -327,6 +427,14 @@ func Default() *Config {
 	c.SessionSticky.Enabled = true
 	c.SessionSticky.TTL = "30m"
 	c.SessionSticky.GCInterval = "5m"
+	c.Admin.AuditFile = "./data/admin_audit.log"
+	c.Alerting.IntervalSeconds = 30
+	c.Alerting.TimeoutSeconds = 5
+	c.Alerting.StartupGraceSeconds = 30
+	c.Alerting.MinHealthyCN = 1
+	c.Alerting.RecoverHealthy = 1
+	c.Alerting.ForTicks = 2
+	c.Alerting.ClearTicks = 2
 	return c
 }
 
@@ -341,7 +449,9 @@ func Load(path string) (*Config, error) {
 				"Docker 部署时若宿主机缺少 config.json，bind mount 会创建同名目录。"+
 				"请先 `cp config.example.json config.json` 或删除该目录（程序会自动生成配置）", path)
 		}
-		raw, err := os.ReadFile(path)
+		// safefile：正文坏（掉电留下全 0 / 半截）时回退 config.json.bak，
+		// 两边都坏才报错——不再让「配置损坏」直接变成起不来。
+		raw, err := safefile.Read(path, nil)
 		if err != nil {
 			return nil, fmt.Errorf("read config: %w", err)
 		}
@@ -420,6 +530,9 @@ func applyEnv(c *Config) {
 	if v := os.Getenv("WB2A_STATE_FILE"); v != "" {
 		c.StateFile = v
 	}
+	if v := os.Getenv("WB2A_DNS"); v != "" {
+		c.DNSServers = splitCSV(v)
+	}
 	if v := os.Getenv("WB2A_KEYS_FILE"); v != "" {
 		c.KeysFile = v
 	}
@@ -462,6 +575,9 @@ func applyEnv(c *Config) {
 	if v := os.Getenv("WB2A_DEVICE_TOKEN_FILE"); v != "" {
 		c.Upstream.DeviceTokenFile = v
 	}
+	if v := os.Getenv("WB2A_DUMP_UPSTREAM"); v != "" {
+		c.Upstream.DumpDir = v
+	}
 	if v := os.Getenv("WB2A_PASSTHROUGH_IP"); v != "" {
 		if b, err := strconv.ParseBool(v); err == nil {
 			c.Upstream.PassthroughIP = b
@@ -481,11 +597,110 @@ func applyEnv(c *Config) {
 	if v := os.Getenv("WB2A_EXPIRING_SOON"); v != "" {
 		c.Pool.ExpiringSoon = v
 	}
+	if v := os.Getenv("WB2A_SCHEDULE_JITTER_MINUTES"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.Schedule.JitterMinutes = n
+		}
+	}
+	if v := os.Getenv("WB2A_ADMIN_ENABLED"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			c.Admin.Enabled = b
+		}
+	}
+	if v := os.Getenv("WB2A_ADMIN_AUDIT_ENABLED"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			c.Admin.AuditEnabled = b
+		}
+	}
+	if v := os.Getenv("WB2A_ADMIN_AUDIT_FILE"); v != "" {
+		c.Admin.AuditFile = v
+	}
+	if v := os.Getenv("WB2A_METRICS_ENABLED"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			c.Metrics.Enabled = b
+		}
+	}
+	if v := os.Getenv("WB2A_BUDGET_DAILY_CREDIT_LIMIT"); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			c.Budget.DailyCreditLimit = f
+		}
+	}
+	if v := os.Getenv("WB2A_ALERTING_ENABLED"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			c.Alerting.Enabled = b
+		}
+	}
+	if v := os.Getenv("WB2A_ALERTING_WEBHOOK_URL"); v != "" {
+		c.Alerting.WebhookURL = v
+	}
 	if v := os.Getenv("WB2A_PREFER_EXPIRING"); v != "" {
 		if b, err := strconv.ParseBool(v); err == nil {
 			c.Pool.PreferExpiring = b
 		}
 	}
+}
+
+// EnvironmentManagedFields 列出被启动环境变量覆盖的配置字段路径（**值不回传**——
+// 面板只用这些名字把对应输入框禁用/提示，避免「改了也不生效」的无效编辑）。
+// 只报告「值合法、启动时确实会生效」的项：int/bool/float 解析不过的 env 视为不生效、不列出。
+// 移植上游 PR #104；字段表覆盖本 fork 全部 WB2A_* 覆盖项（含本 fork 扩展的
+// schedule/admin/metrics/budget/alerting 族）。
+func (c *Config) EnvironmentManagedFields() []string {
+	fields := []struct{ env, path, kind string }{
+		{"WB2A_LISTEN", "listen", ""}, {"WB2A_API_KEY", "api_key", ""},
+		{"WB2A_AUTH_DIR", "auth_dir", ""}, {"WB2A_STATE_FILE", "state_file", ""},
+		{"WB2A_DNS", "dns_servers", ""},
+		{"WB2A_SOFT_RATE", "cooldown.soft_rate", ""}, {"WB2A_SOFT_RATE_MAX", "cooldown.soft_rate_max", ""},
+		{"WB2A_TIMEOUT_SECONDS", "upstream.timeout_seconds", "int"}, {"WB2A_HEADER_TIMEOUT_SECONDS", "upstream.header_timeout_seconds", "int"},
+		{"WB2A_IDLE_TIMEOUT_SECONDS", "upstream.idle_timeout_seconds", "int"}, {"WB2A_USER_AGENT", "upstream.user_agent", ""},
+		{"WB2A_CLIENT_VERSION", "upstream.client_version", ""}, {"WB2A_CLI_VERSION", "upstream.cli_version", ""},
+		{"WB2A_CLIENT_NAME", "upstream.client_name", ""}, {"WB2A_DEVICE_TOKEN", "upstream.device_token", ""},
+		{"WB2A_DEVICE_TOKEN_FILE", "upstream.device_token_file", ""}, {"WB2A_PASSTHROUGH_IP", "upstream.passthrough_ip", "bool"},
+		{"WB2A_SANITIZE_FINGERPRINTS", "features.sanitize_blacklist_fingerprints", "bool"},
+		{"WB2A_PROMPT_MODE", "prompt.mode", ""}, {"WB2A_PROMPT_FILE", "prompt.file", ""},
+		{"WB2A_EXPIRING_SOON", "pool.expiring_soon", ""}, {"WB2A_PREFER_EXPIRING", "pool.prefer_expiring", "bool"},
+		{"WB2A_SCHEDULE_JITTER_MINUTES", "schedule.jitter_minutes", "int"},
+		{"WB2A_ADMIN_ENABLED", "admin.enabled", "bool"}, {"WB2A_ADMIN_AUDIT_ENABLED", "admin.audit_enabled", "bool"},
+		{"WB2A_ADMIN_AUDIT_FILE", "admin.audit_file", ""},
+		{"WB2A_METRICS_ENABLED", "metrics.enabled", "bool"},
+		{"WB2A_BUDGET_DAILY_CREDIT_LIMIT", "budget.daily_credit_limit", "float"},
+		{"WB2A_ALERTING_ENABLED", "alerting.enabled", "bool"}, {"WB2A_ALERTING_WEBHOOK_URL", "alerting.webhook_url", ""},
+	}
+	var out []string
+	for _, field := range fields {
+		value := os.Getenv(field.env)
+		if value == "" {
+			continue
+		}
+		switch field.kind {
+		case "int":
+			if _, err := strconv.Atoi(value); err != nil {
+				continue
+			}
+		case "bool":
+			if _, err := strconv.ParseBool(value); err != nil {
+				continue
+			}
+		case "float":
+			if _, err := strconv.ParseFloat(value, 64); err != nil {
+				continue
+			}
+		}
+		out = append(out, field.path)
+	}
+	return out
+}
+
+// splitCSV 逗号分隔 → 去空白、丢空项（WB2A_DNS 用）。
+func splitCSV(raw string) []string {
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if v := strings.TrimSpace(p); v != "" {
+			out = append(out, v)
+		}
+	}
+	return out
 }
 
 func (c *Config) normalize() error {
@@ -567,6 +782,11 @@ func (c *Config) normalize() error {
 	if c.Pool.CreditFloor < 0 {
 		c.Pool.CreditFloor = 0
 	}
+	// 保底倍率上限：负值钳 0（= 严格模式，任何已知正倍率都拦）。
+	// 不设非零默认是有意的——这是钱相关开关，升级不该静默放宽既有防护。
+	if c.Pool.CreditFloorMaxRate < 0 {
+		c.Pool.CreditFloorMaxRate = 0
+	}
 	if c.Pool.BreakerThreshold <= 0 {
 		c.Pool.BreakerThreshold = 3
 	}
@@ -589,6 +809,28 @@ func (c *Config) normalize() error {
 	}
 	if c.Pool.IdleWeightMax <= 0 {
 		c.Pool.IdleWeightMax = 5.0
+	}
+	// 保留积分：负值非法归零（0 = 关闭，是合法值，不能像 idle_weight 那样回落默认）。
+	// ponytail: nil → 默认 10；显式 0 = 关闭；负值归零。
+	switch {
+	case c.Pool.ReserveCredits == nil:
+		v := int64(10)
+		c.Pool.ReserveCredits = &v
+	case *c.Pool.ReserveCredits < 0:
+		*c.Pool.ReserveCredits = 0
+	}
+	// 账号优先级/占比（issue #62）：非正值视为「未配置」直接剔除——0 在这里不是有意义的
+	// 配置（不是"最低优先级"，也不是"零占比"），留着会让语义有两种解释。剔除后空表与
+	// 键缺席等价，选号行为不变。
+	for uid, pr := range c.Pool.AccountPriority {
+		if pr <= 0 {
+			delete(c.Pool.AccountPriority, uid)
+		}
+	}
+	for uid, sh := range c.Pool.AccountShare {
+		if sh <= 0 {
+			delete(c.Pool.AccountShare, uid)
+		}
 	}
 	if c.Upstream.TimeoutSeconds <= 0 {
 		c.Upstream.TimeoutSeconds = 120
@@ -622,7 +864,41 @@ func (c *Config) normalize() error {
 		c.Schedule.BlackcatHours = []int{23}
 	}
 	if len(c.Schedule.GrowthHours) == 0 {
-		c.Schedule.GrowthHours = []int{1}
+		c.Schedule.GrowthHours = []int{11}
+	}
+	// 排程轮次账号间并发：缺省/0 → 1（老 config 无此键，不能当非法值报错）。
+	if c.Schedule.GrowthConcurrency <= 0 {
+		c.Schedule.GrowthConcurrency = 1
+	}
+	if c.Schedule.GrowthConcurrency > 4 {
+		return fmt.Errorf("schedule.growth_concurrency: %d 非法（1-4，手动入口同为 4 上限）", c.Schedule.GrowthConcurrency)
+	}
+	if c.Schedule.JitterMinutes < 0 || c.Schedule.JitterMinutes > 1440 {
+		return fmt.Errorf("schedule.jitter_minutes: %d 非法（0 = 关闭，上限 1440）", c.Schedule.JitterMinutes)
+	}
+	if c.Budget.DailyCreditLimit < 0 {
+		return fmt.Errorf("budget.daily_credit_limit: %v 不得为负；0 = 不限", c.Budget.DailyCreditLimit)
+	}
+	if c.Budget.BurstCreditLimit < 0 {
+		return fmt.Errorf("budget.burst_credit_limit: %v 不得为负；0 = 关闭", c.Budget.BurstCreditLimit)
+	}
+	if c.Budget.CacheLowRate < 0 || c.Budget.CacheLowRate > 100 {
+		return fmt.Errorf("budget.cache_low_rate: %v 须在 0-100 之间（百分比）；0 = 关闭", c.Budget.CacheLowRate)
+	}
+	if c.Admin.Enabled && strings.TrimSpace(c.APIKey) == "" {
+		return fmt.Errorf("admin.enabled=true 但 api_key 为空")
+	}
+	if c.Admin.AuditEnabled {
+		if !c.Admin.Enabled {
+			return fmt.Errorf("admin.audit_enabled=true 但 admin.enabled=false")
+		}
+		if strings.TrimSpace(c.Admin.AuditFile) == "" {
+			c.Admin.AuditFile = "./data/admin_audit.log"
+		}
+	}
+	if err := c.normalizeAlerting(); err != nil {
+		return err
+
 	}
 	// 余额后台刷新：启用时 minutes<=0 回落默认 5；关闭时 interval 保持 0（不启动）。
 	if c.Schedule.BalanceRefreshEnabled {
@@ -630,6 +906,12 @@ func (c *Config) normalize() error {
 			c.Schedule.BalanceRefreshMinutes = 5
 		}
 		c.BalanceRefreshInterval = time.Duration(c.Schedule.BalanceRefreshMinutes) * time.Minute
+	}
+	if c.Schedule.TaskSweepEnabled {
+		if c.Schedule.TaskSweepMinutes <= 0 {
+			c.Schedule.TaskSweepMinutes = 15
+		}
+		c.TaskSweepInterval = time.Duration(c.Schedule.TaskSweepMinutes) * time.Minute
 	}
 	if err := c.validateScheduleHours(); err != nil {
 		return err
@@ -732,6 +1014,48 @@ func checkHourRange(field, switchKey string, hours []int) error {
 		if h < 0 || h > 23 {
 			return fmt.Errorf("%s: %d 不是合法小时（0-23）；如要关闭该任务请设 schedule.%s=false", field, h, switchKey)
 		}
+	}
+	return nil
+}
+
+func (c *Config) normalizeAlerting() error {
+	a := &c.Alerting
+	if a.IntervalSeconds < 0 || a.TimeoutSeconds < 0 || a.StartupGraceSeconds < 0 ||
+		a.MinHealthyCN < 0 || a.MinHealthyGlobal < 0 || a.RecoverHealthy < 0 ||
+		a.BreakerThreshold < 0 || a.ForTicks < 0 || a.ClearTicks < 0 {
+		return fmt.Errorf("alerting: 数值不得为负")
+	}
+	if a.IntervalSeconds == 0 {
+		a.IntervalSeconds = 30
+	}
+	if a.TimeoutSeconds == 0 {
+		a.TimeoutSeconds = 5
+	}
+	if a.StartupGraceSeconds == 0 {
+		a.StartupGraceSeconds = 30
+	}
+	if a.ForTicks == 0 {
+		a.ForTicks = 2
+	}
+	if a.ClearTicks == 0 {
+		a.ClearTicks = 2
+	}
+	if a.RecoverHealthy == 0 {
+		a.RecoverHealthy = 1
+	}
+	if !a.Enabled {
+		return nil
+	}
+	raw := strings.TrimSpace(a.WebhookURL)
+	if raw == "" {
+		return fmt.Errorf("alerting.enabled=true 但 alerting.webhook_url 为空")
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("alerting.webhook_url: %w", err)
+	}
+	if (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return fmt.Errorf("alerting.webhook_url: 需要 http(s) 地址")
 	}
 	return nil
 }

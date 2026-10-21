@@ -30,10 +30,11 @@ import (
 // 说明非权威分类，误判代价只是多一条中性补充说明）；其余走 Kind 一对一映射。
 func GatewayHint(kind ErrKind, msg string, ctx HintContext) string {
 	// 11133 model_param_invalid 家族（图片回归实测：不支持图片的模型传图，或任意
-	// 参数被模型供应商拒绝）。只有请求确实带图、且目录能对该模型做出「不支持图片」
-	// 的判定时才给「换模型」指向，否则退中性参数形态（可能是任意参数问题，不点名图片）。
+	// 参数被模型供应商拒绝）。只有请求确实带图、且目录**显式声明**该模型不支持图片
+	// 时才给「换模型」指向——目录只收录而不声明该能力（缺键）时无从判断，退中性
+	// 参数形态（断言「不支持」等于编造能力事实，客户端会照 hint 白换模型）。
 	if isModelParamInvalid(msg) {
-		if ctx.HasImage && ctx.ModelInCatalog && !ctx.ModelSupportsImages {
+		if ctx.HasImage && ctx.ModelInCatalog && ctx.ModelSupportsImagesKnown && !ctx.ModelSupportsImages {
 			return "model " + ctx.Model + " does not support images; pick one with supports_images=true from /v1/models"
 		}
 		return "request parameters were rejected by the model provider; check message format and model capabilities"
@@ -59,6 +60,15 @@ func GatewayHint(kind ErrKind, msg string, ctx HintContext) string {
 		return "account session expired at upstream; the account is disabled until re-login"
 	case ErrHardCredit:
 		return "account credits exhausted at upstream; waiting for daily check-in to restore"
+	case ErrUpstreamBusy:
+		// 6021 queue.full：渠道级容量满载。措辞明确「不是账号问题、换号无意义」，
+		// 指引客户端短等待后重试（SDK 指数退避天然适配）。
+		return "upstream admission queue is full (channel-level capacity, not an account problem); retry after a short wait"
+	case ErrToolMismatch:
+		// 11148 配对断裂：请求内容（会话历史里的 tool_calls / tool 结果）本身对不上，
+		// 上游明示「直接重试无效，请新建任务」。措辞指向「开新会话」而不是「换个账号
+		// 重试」——换号/重试都必然同样失败。
+		return "request tool-call history is broken (call/result mismatch); upstream rejects this request as-is — start a new conversation instead of retrying"
 	case ErrModelBlocked:
 		return "upstream has no such model on this backend; switch model or retry on another account"
 	case ErrContentBlocked:
@@ -77,7 +87,10 @@ type HintContext struct {
 	Model               string // 请求裸模型名（可空）
 	HasImage            bool   // 请求体是否携带 image_url part
 	ModelSupportsImages bool   // 模型目录 supports_images 声明（仅 ModelInCatalog 时有意义）
-	ModelInCatalog      bool   // 模型目录是否收录该模型（「不支持」判定的前提）
+	// ModelSupportsImagesKnown 目录是否**显式**声明过该能力。缺失时不得断言「不支持
+	// 图片」（那是编造能力事实），只能退中性参数文案。
+	ModelSupportsImagesKnown bool
+	ModelInCatalog           bool // 模型目录是否收录该模型（「不支持」判定的前提）
 }
 
 // noHealthyHint 本地调度类错误（池中无健康号可用/传输层抖动，无上游原文可透传）
@@ -139,6 +152,11 @@ func isInvalidImageData(body string) bool {
 
 // codeMarker JSON code 字段命中（`"code":N` / `"code": N` / `"code":"N"` 形态，
 // 与 IsModelBlocked 的 code 判定同容差口径）。lower 须为小写 body。
+// HasCodeMarker 包外判据入口（server 侧 applyErrorPolicy 分野用）：按 codeMarker 的空白
+// 容差在原文里找业务码。同一条 msg 骑不同 code 的故障要靠它区分——例如 "request illegal"
+// 既是 11140 授权风控，也是 "11-128" 渠道校验拦截（见 handler 的 ErrAccountFault 分支）。
+func HasCodeMarker(body, code string) bool { return codeMarker(strings.ToLower(body), code) }
+
 func codeMarker(lower, code string) bool {
 	for _, v := range []string{`"code":` + code, `"code": ` + code, `"code":"` + code + `"`, `"code": "` + code + `"`, `"code":" ` + code + `"`, `"code": '` + code + `'`} {
 		if strings.Contains(lower, v) {

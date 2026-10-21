@@ -693,6 +693,44 @@ func TestWriteDefault(t *testing.T) {
 	}
 }
 
+// 补领清扫（issue #174）：缺省启用 + 15 分钟；显式关闭时 interval 归零（不启动）；
+// minutes<=0 回落 15。
+func TestTaskSweepDefaults(t *testing.T) {
+	c := Default()
+	if err := c.normalize(); err != nil {
+		t.Fatal(err)
+	}
+	if !c.Schedule.TaskSweepEnabled || c.TaskSweepInterval != 15*time.Minute {
+		t.Errorf("default task sweep: enabled=%v interval=%v", c.Schedule.TaskSweepEnabled, c.TaskSweepInterval)
+	}
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"schedule":{"task_sweep_minutes":3}}`), 0o600)
+	c2, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c2.TaskSweepInterval != 3*time.Minute {
+		t.Errorf("interval=%v want 3m", c2.TaskSweepInterval)
+	}
+	os.WriteFile(fp, []byte(`{"schedule":{"task_sweep_enabled":false}}`), 0o600)
+	c3, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c3.TaskSweepInterval != 0 {
+		t.Errorf("disabled interval=%v want 0", c3.TaskSweepInterval)
+	}
+	os.WriteFile(fp, []byte(`{"schedule":{"task_sweep_minutes":-5}}`), 0o600)
+	c4, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c4.TaskSweepInterval != 15*time.Minute {
+		t.Errorf("negative minutes interval=%v want 15m", c4.TaskSweepInterval)
+	}
+}
+
 func TestBalanceRefreshDefaults(t *testing.T) {
 	// 缺省：启用 + 30 分钟
 	c := Default()
@@ -885,6 +923,36 @@ func TestLoadConfigPathIsDirectory(t *testing.T) {
 	}
 }
 
+// TestReserveCreditsDefaultAndOff 保留积分默认值语义：
+// 键缺席 → 10（默认留一线）；显式 0 → 关闭；显式值 → 原样。
+func TestReserveCreditsDefaultAndOff(t *testing.T) {
+	dir := t.TempDir()
+	load := func(t *testing.T, body string) *int64 {
+		t.Helper()
+		fp := filepath.Join(dir, strings.ReplaceAll(t.Name(), "/", "_")+".json")
+		if err := os.WriteFile(fp, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		c, err := Load(fp)
+		if err != nil {
+			t.Fatalf("load: %v", err)
+		}
+		return c.Pool.ReserveCredits
+	}
+	if v := load(t, `{}`); v == nil || *v != 10 {
+		t.Errorf("键缺席 reserve_credits=%v want 10（默认）", v)
+	}
+	if v := load(t, `{"pool":{"reserve_credits":0}}`); v == nil || *v != 0 {
+		t.Errorf("显式 0 reserve_credits=%v want 0（关闭）", v)
+	}
+	if v := load(t, `{"pool":{"reserve_credits":5000}}`); v == nil || *v != 5000 {
+		t.Errorf("显式值 reserve_credits=%v want 5000", v)
+	}
+	if v := load(t, `{"pool":{"reserve_credits":-5}}`); v == nil || *v != 0 {
+		t.Errorf("负值 reserve_credits=%v want 0（归零）", v)
+	}
+}
+
 // TestServerReadTimeout 入站读取上限（issue #100）：空值回落默认 300s；
 // "0" = 显式不限制（0 是合法值不回落）；负值 fail fast（静默钳 0 会把保护悄悄关掉）。
 func TestServerReadTimeout(t *testing.T) {
@@ -927,6 +995,47 @@ func TestServerReadTimeout(t *testing.T) {
 	c.Server.ReadTimeout = "bogus"
 	if err := c.normalize(); err == nil {
 		t.Error("unparsable read_timeout should fail fast")
+	}
+}
+
+// TestDNSServersConfigAndEnv dns_servers 两种来源：配置文件数组原样保留；
+// WB2A_DNS 逗号分隔覆盖（去空白、丢空项）。空 = 系统解析器，不得塞空串进去。
+func TestDNSServersConfigAndEnv(t *testing.T) {
+	c, err := ParseConfig([]byte(`{"dns_servers":["223.5.5.5","1.1.1.1:5353"]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(c.DNSServers, ","); got != "223.5.5.5,1.1.1.1:5353" {
+		t.Fatalf("文件配置 dns_servers=%v", c.DNSServers)
+	}
+
+	t.Setenv("WB2A_DNS", " 119.29.29.29 , ,8.8.8.8")
+	c2, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(c2.DNSServers, ","); got != "119.29.29.29,8.8.8.8" {
+		t.Fatalf("WB2A_DNS 覆盖结果=%v", c2.DNSServers)
+	}
+
+	// 面板/环境变量管理的字段清单要认它，否则面板会让人以为改了配置能生效。
+	managed := c2.EnvironmentManagedFields()
+	found := false
+	for _, f := range managed {
+		if f == "dns_servers" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("dns_servers 应出现在环境变量管理字段里：%v", managed)
+	}
+
+	c3, err := ParseConfig([]byte(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(c3.DNSServers) != 0 {
+		t.Fatalf("缺省应为空（系统解析器）：%v", c3.DNSServers)
 	}
 }
 

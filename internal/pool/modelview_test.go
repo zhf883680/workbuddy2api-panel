@@ -22,7 +22,7 @@ func lockViewPool(t *testing.T) *Pool {
 	return p
 }
 
-// setModelCooldown 直接写模型级冷却（与 modelblocked_test.go 同法）。
+// setModelCooldown 直接写模型级冷却。
 func setModelCooldown(p *Pool, uid, model string, until time.Time, reason string, auditOnly bool) {
 	p.mu.Lock()
 	e := p.byUID[uid]
@@ -198,34 +198,33 @@ func TestModelLockViewRealmIsolation(t *testing.T) {
 // TestModelLockViewSortsLockedFirst 整池不可用排在部分限流前面，方便一眼看到最该处理的。
 func TestModelLockViewSortsLockedFirst(t *testing.T) {
 	p := lockViewPool(t)
-	base := time.Now()
-	setModelCooldown(p, "u1", "glm-5.3", base.Add(time.Hour), "6004", false)
-	setModelCooldown(p, "u2", "glm-5.3", base.Add(time.Hour), "6004", false)
-	setModelCooldown(p, "u1", "kimi-k2", base.Add(time.Hour), "6004", false)
+	// glm-5.3：只锁 u1，u2 还能服务 → partial。
+	// deepseek-x：两个号都被锁 → locked（谁都不能服务）。
+	setModelCooldown(p, "u1", "glm-5.3", time.Now().Add(time.Hour), "6004", false)
+	setModelCooldown(p, "u1", "deepseek-x", time.Now().Add(time.Hour), "6004", false)
+	setModelCooldown(p, "u2", "deepseek-x", time.Now().Add(time.Hour), "6004", false)
 
 	rows := p.ModelLockView()
 	if len(rows) != 2 {
 		t.Fatalf("want 2 rows, got %+v", rows)
 	}
-	if rows[0].State != "locked" || rows[1].State != "partial" {
-		t.Errorf("整池不可用应排在部分限流前：%+v", rows)
+	if rows[0].Model != "deepseek-x" || rows[0].State != "locked" {
+		t.Errorf("整池不可用的模型应排第一，得到 %+v", rows[0])
 	}
-	if rows[0].Model != "glm-5.3" {
-		t.Errorf("首行应为 glm-5.3，得到 %q", rows[0].Model)
+	if rows[1].Model != "glm-5.3" || rows[1].State != "partial" {
+		t.Errorf("部分限流应排第二，得到 %+v", rows[1])
 	}
 }
 
-// TestModelLockViewAfterClear 走真实写入/清除通道（而非只手搓 map）：
-// BlockModelBackoff 后应出 partial 行，BlockModelClear 后应回到 nil。
-func TestModelLockViewAfterClear(t *testing.T) {
+// TestModelLockViewUnlockAfterExpiry 冷却到期后视图回落空清单。
+func TestModelLockViewUnlockAfterExpiry(t *testing.T) {
 	p := lockViewPool(t)
-	p.BlockModelBackoff("u1", "glm-5.3", "11102 model [glm-5.3] service info not found")
-	rows := p.ModelLockView()
-	if len(rows) != 1 || rows[0].State != "partial" {
-		t.Fatalf("写入负缓存后应有一行 partial：%+v", rows)
+	setModelCooldown(p, "u1", "glm-5.3", time.Now().Add(20*time.Millisecond), "6004", false)
+	if rows := p.ModelLockView(); len(rows) != 1 {
+		t.Fatalf("冷却内应出一行，得到 %+v", rows)
 	}
-	p.BlockModelClear("u1", "glm-5.3")
+	time.Sleep(30 * time.Millisecond)
 	if rows := p.ModelLockView(); rows != nil {
-		t.Fatalf("清除后应回到 nil：%+v", rows)
+		t.Fatalf("解锁后应回落 nil，得到 %+v", rows)
 	}
 }

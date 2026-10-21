@@ -1,5 +1,6 @@
-// cache_stats_test.go 钉住缓存命中率观测链路（issue #92）：SSE 末帧的
-// prompt_cache_hit/miss_tokens 采集，以及「曾命中却整段未命中」的 WARN 信号判据。
+// cache_stats_test.go 钉住缓存命中率观测链路（issue #92 同步）：SSE 末帧的
+// prompt_cache_hit/miss_tokens 采集（miss 缺失时按 prompt-hit 推导），以及
+// 「曾命中却整段未命中」的 WARN 信号判据。
 package server
 
 import (
@@ -14,14 +15,14 @@ func feedStatsLines(s *chatStatsReader, lines ...string) {
 	}
 }
 
-// 流式末帧带 hit/miss：CacheTokens 原样返回；只带 hit 时 miss 按 prompt-hit 推导；
+// 流式末帧带 hit/miss：Cache 原样返回；只带 hit 时 miss 按 prompt-hit 推导；
 // 上游完全没回缓存维度时 ok=false（不参与统计）。
 func TestStatsReaderCacheTokens(t *testing.T) {
 	s := newChatStatsReaderSince(strings.NewReader(""), time.Now())
 	feedStatsLines(s,
 		`data: {"usage":{"prompt_tokens":1000,"completion_tokens":5,"total_tokens":1005,"credit":0.1,"prompt_cache_hit_tokens":900,"prompt_cache_miss_tokens":100}}`,
 	)
-	if hit, miss, ok := s.CacheTokens(); !ok || hit != 900 || miss != 100 {
+	if hit, miss, ok := s.Cache(); !ok || hit != 900 || miss != 100 {
 		t.Fatalf("hit=%d miss=%d ok=%v, want 900/100/true", hit, miss, ok)
 	}
 
@@ -29,7 +30,7 @@ func TestStatsReaderCacheTokens(t *testing.T) {
 	feedStatsLines(s2,
 		`data: {"usage":{"prompt_tokens":8500,"prompt_cache_hit_tokens":8400}}`,
 	)
-	if hit, miss, ok := s2.CacheTokens(); !ok || hit != 8400 || miss != 100 {
+	if hit, miss, ok := s2.Cache(); !ok || hit != 8400 || miss != 100 {
 		t.Fatalf("derived miss: hit=%d miss=%d ok=%v, want 8400/100/true", hit, miss, ok)
 	}
 
@@ -37,7 +38,7 @@ func TestStatsReaderCacheTokens(t *testing.T) {
 	feedStatsLines(s3,
 		`data: {"usage":{"prompt_tokens":100,"completion_tokens":5}}`,
 	)
-	if _, _, ok := s3.CacheTokens(); ok {
+	if _, _, ok := s3.Cache(); ok {
 		t.Fatal("无缓存字段应 ok=false")
 	}
 }
@@ -76,4 +77,11 @@ func TestCacheMissSignal(t *testing.T) {
 	cacheMissWarn.noteCacheTokens("glm-5.3", 500, 0, 500)
 	// miss 缺失（上游只回 hit=0、无 miss、无 prompt）不触发。
 	cacheMissWarn.noteCacheTokens("glm-5.3", 0, 0, 0)
+	// issue #170：显式 miss 极小（3/52703 = 99.99% 命中）不算「整段未命中」。
+	// 此前判据只看 hit>0，这组自相矛盾的字段（hit 缺席/为 0）会打出假告警。
+	cacheMissWarn.noteCacheTokens("gpt-6-luna", 52703, 52700, 3) // 先建立 everHit
+	cacheMissWarn.noteCacheTokens("gpt-6-luna", 52703, 0, 3)
+	if !cacheMissWarn.last["gpt-6-luna"].IsZero() {
+		t.Fatal("显式 miss 极小（3/52703）不应触发整段未命中告警")
+	}
 }
