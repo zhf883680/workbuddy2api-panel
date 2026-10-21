@@ -1051,6 +1051,26 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         </div>
 
         <div class="box">
+          <header><h3>安全</h3></header>
+          <div class="pad">
+            <div class="switch"><span class="lb">登录失败锁定</span>
+              <input type="checkbox" name="login_lockout_enabled"></div>
+            <div class="grid3">
+              <label class="fld"><span class="lb">失败次数阈值</span>
+                <input name="login_lockout_max_fails" type="number" min="1" placeholder="5">
+                <span class="hint">同一来源在窗口内失败达到该次数即锁定</span></label>
+              <label class="fld"><span class="lb">失败计数窗口</span>
+                <input name="login_lockout_window" placeholder="5m">
+                <span class="hint">Go 时长：5m / 300s</span></label>
+              <label class="fld"><span class="lb">锁定时长</span>
+                <input name="login_lockout_duration" placeholder="10m">
+                <span class="hint">锁定期内一律 429，到期自动解锁</span></label>
+            </div>
+            <div class="hint">鉴权失败按来源 IP（代理后取 <code>X-Forwarded-For</code> 首段）累计：覆盖面板密钥门、<code>/status</code> 与 <code>/v1</code>。锁定期内正确密钥同样被拒，状态在内存中，重启进程即清空。</div>
+          </div>
+        </div>
+
+        <div class="box">
           <header><h3>定时任务</h3></header>
           <div class="pad">
             <div class="grid2">

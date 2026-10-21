@@ -68,10 +68,12 @@ async function api(path, opts = {}) {
   if (k) h['Authorization'] = 'Bearer ' + k;
   if (opts.body) h['Content-Type'] = 'application/json';
   const r = await fetch('/panel/api/' + path, Object.assign({}, opts, { headers: h }));
+  const d = await r.json().catch(() => ({}));
   // status 挂到错误上：调用方靠它区分「可重试的抖动」与「重试无意义的终态」
   // （登录轮询据此决定继续等 OAuth 还是提示重新发起）。
-  if (r.status === 401) { openKey(); const e = new Error('密钥无效或未填写'); e.status = 401; throw e; }
-  const d = await r.json().catch(() => ({}));
+  // 401 / 429 都属于鉴权门：401 是密钥不对，429 是登录失败锁定（loginlock）。
+  if (r.status === 401) { const m = '密钥不正确，请重新输入。'; openKeyWith(m); const e = new Error(m); e.status = 401; throw e; }
+  if (r.status === 429) { const m = d.error || '登录失败次数过多，请稍后再试。'; openKeyWith(m); const e = new Error(m); e.status = 429; throw e; }
   if (!r.ok) { const e = new Error(d.error || ('HTTP ' + r.status)); e.status = r.status; throw e; }
   return d;
 }
@@ -346,6 +348,12 @@ function formatRate(rate) {
 
 /* ── 密钥门 ───────────────────────────────────────────────────────── */
 function openKey() { $('keyVeil').classList.add('on'); setTimeout(() => $('keyInput').focus(), 60); }
+function openKeyWith(msg) {
+  if (refTimer) { clearInterval(refTimer); refTimer = null; }
+  $('keyErr').textContent = msg;
+  $('keyErr').hidden = false;
+  openKey();
+}
 $('btnKey').onclick = async () => {
   const v = $('keyInput').value.trim();
   if (!v) return;
@@ -355,7 +363,7 @@ $('btnKey').onclick = async () => {
     $('keyErr').hidden = true;
     $('keyVeil').classList.remove('on');
     start();
-  } catch (e) { $('keyErr').hidden = false; }
+  } catch (e) { $('keyErr').textContent = e.message || '密钥不正确，请重试。'; $('keyErr').hidden = false; }
 };
 $('keyInput').addEventListener('keydown', e => { if (e.key === 'Enter') $('btnKey').click(); });
 
@@ -1256,6 +1264,10 @@ $('btnLogPin').onclick = () => {
 const CFG_MAP = {
   listen: ['listen'], api_key: ['api_key'],
   package_detail_limit: ['panel', 'package_detail_limit'],
+  login_lockout_enabled: ['security', 'login_lockout', 'enabled'],
+  login_lockout_max_fails: ['security', 'login_lockout', 'max_fails'],
+  login_lockout_window: ['security', 'login_lockout', 'window'],
+  login_lockout_duration: ['security', 'login_lockout', 'lock_duration'],
   checkin_hours: ['schedule', 'checkin_hours'], checkin_enabled: ['schedule', 'checkin_enabled'],
   travel_hours: ['schedule', 'travel_hours'], travel_enabled: ['schedule', 'travel_enabled'],
   activity_hours: ['schedule', 'activity_hours'], activity_enabled: ['schedule', 'activity_enabled'],
@@ -3719,10 +3731,10 @@ function openKeyCreate() {
   keyEditID = null;
   $('keyDlgTitle').textContent = '新建密钥';
   $('keyName').value = '';
-  $('keyMode').value = 'global';
+  $('keyMode').value = 'bound';
   $('keyExpires').value = '';
   $('keyEnabled').checked = true;
-  $('keyUidsWrap').hidden = true;
+  $('keyUidsWrap').hidden = false;
   renderKeyUIDPicker();
   $('keyCreateVeil').classList.add('on');
   setTimeout(() => $('keyName').focus(), 60);
@@ -3768,6 +3780,10 @@ if ($('btnKeyPlainClose')) $('btnKeyPlainClose').onclick = () => {
 if ($('btnKeySave')) $('btnKeySave').onclick = async () => {
   const payload = keyFormPayload();
   const editing = keyEditID;
+  if (!editing && payload.mode === 'bound' && !payload.uids.length) {
+    toast('请至少勾选一个可用账号（或把模式切到全局池）', 'err');
+    return;
+  }
   try {
     const d = editing
       ? await api('keys/' + encodeURIComponent(editing) + '/update', { method: 'POST', body: JSON.stringify(payload) })
@@ -3779,7 +3795,7 @@ if ($('btnKeySave')) $('btnKeySave').onclick = async () => {
   } catch (e) { toast(e.message, 'err'); }
 };
 
-if ($('keysBody')) $('keysBody').addEventListener('click', async ev => {
+if ($('keysBody') && $('keysBody').addEventListener) $('keysBody').addEventListener('click', async ev => {
   const b = ev.target.closest('button[data-k]');
   if (!b) return;
   const id = b.dataset.k, action = b.dataset.a;

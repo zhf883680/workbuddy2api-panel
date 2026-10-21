@@ -1890,6 +1890,12 @@ func parseUsageTotalTokens(total float64) (int, bool) {
 	if math.IsNaN(total) || math.IsInf(total, 0) || total <= 0 || math.Trunc(total) != total {
 		return 0, false
 	}
+	// float64(math.MaxInt64) rounds to 2^63, so an input of 2^63 can convert
+	// to MaxInt64 on platforms that saturate. Reject the boundary value before
+	// conversion to avoid accepting an out-of-range token total.
+	if total >= float64(math.MaxInt64) {
+		return 0, false
+	}
 	parsed := int(total)
 	if parsed <= 0 || float64(parsed) != total {
 		return 0, false
