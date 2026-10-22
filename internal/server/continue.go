@@ -65,9 +65,9 @@ type continueReader struct {
 	seg      int  // 当前段序号（0 起）
 	limitSet bool // 客户端显式带了输出限额：尊重之，不续写
 
-	finish   string   // 本段 finish_reason（续写时每段重置）
-	tail     []string // finish 之后的帧：续写时丢弃，降级时原样回放
-	text     strings.Builder
+	finish   string          // 本段 finish_reason（续写时每段重置）
+	tail     []string        // finish 之后的帧：续写时丢弃，降级时原样回放
+	text     strings.Builder // 客户端可见正文（不含续写段被裁掉的重述前缀）
 	reason   strings.Builder
 	toolSeen bool
 	errSeen  bool
@@ -208,21 +208,20 @@ func (r *continueReader) frame(payload string) {
 					deltaNonEmpty = true
 				}
 				if s, ok := d["content"].(string); ok && s != "" {
-					r.text.WriteString(s)
 					if r.seg > 0 && r.continueCheck {
 						s = r.trimContinuationPrefix(s)
-						if s == "" {
-							delete(d, "content")
-							rebuilt = true
-						} else if s != d["content"] {
+						if s != d["content"] {
 							d["content"] = s
 							rebuilt = true
 						}
-						if s == "" {
-							deltaNonEmpty = false
-						}
 					}
-					deltaNonEmpty = true
+					if s == "" {
+						delete(d, "content")
+						rebuilt = true
+					} else {
+						r.text.WriteString(s)
+						deltaNonEmpty = true
+					}
 				}
 				if tcs, ok := d["tool_calls"].([]any); ok && len(tcs) > 0 {
 					r.toolSeen = true

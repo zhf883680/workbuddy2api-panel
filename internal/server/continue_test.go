@@ -176,6 +176,77 @@ func TestContinueReaderDropsRepeatedPreviousText(t *testing.T) {
 	}
 }
 
+// TestContinueReaderRepeatedPrefixNotRetainedInNextContext 续写段完整重述旧正文后
+// 再次触达 length 时，下一次续写请求只能携带客户端实际见过的正文，不能把被裁掉的
+// 重述内容再次塞进 assistant 上下文。
+func TestContinueReaderRepeatedPrefixNotRetainedInNextContext(t *testing.T) {
+	const repeatedThenLength = `data: {"id":"cmpl-2","choices":[{"index":0,"delta":{"content":"你好世界"}}]}` + "\n\n" +
+		`data: {"id":"cmpl-2","choices":[{"index":0,"delta":{},"finish_reason":"length"}]}` + "\n\n" +
+		"data: [DONE]\n\n"
+	up, reqs := fakeContinueUpstream(t, func(call int) (int, string) {
+		if call == 1 {
+			return 200, repeatedThenLength
+		}
+		return 200, testSeg2Text
+	})
+	r := newTestContinueReader(t, up, `{"model":"m","messages":[{"role":"user","content":"hi"}]}`,
+		io.NopCloser(strings.NewReader(testSeg1Text)))
+	if _, err := io.ReadAll(r); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if len(*reqs) != 2 {
+		t.Fatalf("续写请求数=%d want 2", len(*reqs))
+	}
+
+	var obj struct {
+		Messages []struct {
+			Role    string `json:"role"`
+			Content string `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal([]byte((*reqs)[1]), &obj); err != nil {
+		t.Fatalf("decode second continuation: %v", err)
+	}
+	var assistant string
+	for i := len(obj.Messages) - 1; i >= 0; i-- {
+		if obj.Messages[i].Role == "assistant" {
+			assistant = obj.Messages[i].Content
+			break
+		}
+	}
+	if assistant != "你好世界" {
+		t.Fatalf("second continuation assistant content=%q want %q", assistant, "你好世界")
+	}
+}
+
+// TestContinueReaderBufferedReplayEmitsKeepalive 判断续写段是否重述旧正文时，
+// 被缓冲区暂存的正文帧仍要按 keepaliveEvery 向客户端喂活，不能形成新的静默窗口。
+func TestContinueReaderBufferedReplayEmitsKeepalive(t *testing.T) {
+	old := keepaliveEvery
+	keepaliveEvery = 0
+	t.Cleanup(func() { keepaliveEvery = old })
+
+	const repeated = `data: {"id":"cmpl-2","choices":[{"index":0,"delta":{"content":"你好"}}]}` + "\n\n" +
+		`data: {"id":"cmpl-2","choices":[{"index":0,"delta":{"content":"世界"}}]}` + "\n\n" +
+		`data: {"id":"cmpl-2","choices":[{"index":0,"delta":{"content":"继续"}}]}` + "\n\n" +
+		`data: {"id":"cmpl-2","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}` + "\n\n" +
+		"data: [DONE]\n\n"
+	up, _ := fakeContinueUpstream(t, func(int) (int, string) { return 200, repeated })
+	r := newTestContinueReader(t, up, `{"model":"m","messages":[{"role":"user","content":"hi"}]}`,
+		io.NopCloser(strings.NewReader(testSeg1Text)))
+	out, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	s := string(out)
+	if !strings.Contains(s, ": keepalive") {
+		t.Fatalf("缓冲重述前缀期间缺 keepalive:\n%s", s)
+	}
+	if !strings.Contains(s, `"content":"继续"`) {
+		t.Fatalf("裁掉完整旧前缀后应保留新增内容:\n%s", s)
+	}
+}
+
 // TestContinueReaderKeepsRepeatedWordMidContinuation 只裁剪续写开头的完整旧前缀，
 // 一旦续写进入新内容，句中正常重复的词语必须原样保留。
 func TestContinueReaderKeepsRepeatedWordMidContinuation(t *testing.T) {
