@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
@@ -534,10 +535,10 @@ func TestResponsesEndpointStreamErrorBeforeSSE(t *testing.T) {
 }
 
 // TestResponsesEndpointStreamSilentToolStopFails Codex 声明了工具，但上游只返回
-// 一段文本并以 normal stop 结束。该回合没有可执行动作，不能伪装成 completed，
-// 否则 Codex 会把 agent loop 当成正常完成并静默停下。
+// 一句以冒号结尾的宣告文本并以 normal stop 结束。该回合没有可执行动作，不能
+// 伪装成 completed，否则 Codex 会把 agent loop 当成正常完成并静默停下。
 func TestResponsesEndpointStreamSilentToolStopFails(t *testing.T) {
-	const silentStop = "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"I will inspect the files\"}}]}\n\n" +
+	const silentStop = "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"I will inspect the files:\"}}]}\n\n" +
 		"data: {\"id\":\"c1\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" +
 		"data: [DONE]\n\n"
 	up := newFakeUpstream(t, func(string) (int, string, bool) { return 200, silentStop, true })
@@ -555,8 +556,28 @@ func TestResponsesEndpointStreamSilentToolStopFails(t *testing.T) {
 	if !strings.Contains(body, `"code":"upstream_silent_tool_stop"`) {
 		t.Fatalf("missing silent-stop error code: %s", body)
 	}
-	if !strings.Contains(body, `"delta":"I will inspect the files"`) {
+	if !strings.Contains(body, `"delta":"I will inspect the files:"`) {
 		t.Fatalf("already-emitted text must remain visible: %s", body)
+	}
+}
+
+// TestResponsesEndpointStreamFinalTextWithToolsCompletes 普通最终回答即使携带
+// tools 声明也会正常结束；只有像「继续处理：」这样以冒号收尾的宣告句才判静默停转。
+func TestResponsesEndpointStreamFinalTextWithToolsCompletes(t *testing.T) {
+	const textStop = "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"The answer is 42.\"}}]}\n\n" +
+		"data: {\"id\":\"c1\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" +
+		"data: [DONE]\n\n"
+	up := newFakeUpstream(t, func(string) (int, string, bool) { return 200, textStop, true })
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/v1/responses", strings.NewReader(
+		`{"model":"m","input":"answer directly","stream":true,"tools":[{"type":"function","name":"Bash","parameters":{"type":"object"}}]}`))
+	h.ServeHTTP(rec, req)
+	body := rec.Body.String()
+	types := sseTypes(body)
+	if !containsStr(types, "response.completed") || containsStr(types, "response.failed") {
+		t.Fatalf("types=%v body=%s", types, body)
 	}
 }
 
@@ -577,6 +598,40 @@ func TestResponsesEndpointStreamSilentStopToolChoiceNoneCompletes(t *testing.T) 
 	types := sseTypes(body)
 	if !containsStr(types, "response.completed") || containsStr(types, "response.failed") {
 		t.Fatalf("types=%v body=%s", types, body)
+	}
+}
+
+// TestResponsesEndpointAutoContinueSwitch 关闭自动续写后，Responses 截断流
+// 只调用上游一次并返回 incomplete；打开后恢复原有续写行为。
+func TestResponsesEndpointAutoContinueSwitch(t *testing.T) {
+	const truncated = "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"}}]}\n\n" +
+		"data: {\"id\":\"c1\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"length\"}]}\n\n" +
+		"data: [DONE]\n\n"
+	calls := 0
+	up := newFakeUpstream(t, func(string) (int, string, bool) {
+		calls++
+		return 200, truncated, true
+	})
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{
+		Pool:         p,
+		Upstream:     up,
+		AutoContinue: false,
+		Live: livecfg.New(livecfg.Snapshot{
+			AutoContinue:    false,
+			AutoContinueSet: true,
+		}),
+	})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/v1/responses", strings.NewReader(
+		`{"model":"m","input":"write a long file","stream":true}`))
+	h.ServeHTTP(rec, req)
+	if calls != 1 {
+		t.Fatalf("auto_continue disabled: upstream calls=%d want 1", calls)
+	}
+	types := sseTypes(rec.Body.String())
+	if !containsStr(types, "response.incomplete") {
+		t.Fatalf("types=%v body=%s", types, rec.Body.String())
 	}
 }
 

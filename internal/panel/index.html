@@ -1231,6 +1231,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
                 <input name="idle_timeout_seconds" type="number" min="1" placeholder="300">
                 <span class="hint">需重启</span></label>
             </div>
+            <div class="switch"><span class="lb">截断后自动续写</span>
+              <input type="checkbox" name="auto_continue">
+              <span class="hint">关闭后 length 截断直接交给客户端，不再追加第二次上游请求；保存即生效</span></div>
             <div class="hr"></div>
             <div class="grid2">
               <label class="fld"><span class="lb">出站 User-Agent</span>

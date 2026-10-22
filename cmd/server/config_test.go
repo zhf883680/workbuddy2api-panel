@@ -362,6 +362,9 @@ func TestUpstreamTimeoutDefaults(t *testing.T) {
 	if err := c.normalize(); err != nil {
 		t.Fatalf("normalize: %v", err)
 	}
+	if !c.Upstream.AutoContinue {
+		t.Error("upstream.auto_continue default should be true")
+	}
 	if c.Upstream.TimeoutSeconds != 120 {
 		t.Errorf("timeout_seconds=%d want 120", c.Upstream.TimeoutSeconds)
 	}

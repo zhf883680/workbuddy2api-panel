@@ -107,6 +107,8 @@ type Config struct {
 	// 来自 logging.request_client_info（缺省 true）；关闭时 reqlog 事件的来源字段
 	// 保持为空，归档与面板都不出现来源信息。
 	RecordClientInfo bool
+	// AutoContinue 上游截断后是否自动续写；缺省 true。
+	AutoContinue bool
 }
 
 // loadLive 返回当前运行期快照；Live 为 nil 时用静态字段合成。
@@ -118,6 +120,8 @@ func (h *Handler) loadLive() livecfg.Snapshot {
 		APIKey:           h.cfg.APIKey,
 		SoftCooldown:     h.cfg.SoftCooldown,
 		RecordClientInfo: h.cfg.RecordClientInfo,
+		AutoContinue:     h.cfg.AutoContinue,
+		AutoContinueSet:  true,
 		HiddenModels:     livecfg.NormalizeHiddenModels(h.cfg.ModelsHidden),
 		ModelAliases:     livecfg.NormalizeModelAliases(h.cfg.ModelsAliases),
 	}
@@ -1507,8 +1511,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			st.status = http.StatusOK
 			// 截断自动续写（见 continue.go）：上游 finish_reason=length 且为纯文本/推理
 			// 段时，同账号同模型补发「已输出内容+续写指令」，多段拼成一条客户端可见流。
-			// 显式限额 / 工具参数截断 / 续写请求失败 → 自动降级为今天的截断终态。
+			// 显式限额 / 工具参数截断 / 续写请求失败 → 自动降级为截断终态。
 			cont := newContinueReader(r.Context(), h.cfg.Upstream, acct, body, clientIP, chatMeta, rc)
+			liveCfg := h.loadLive()
+			cont.enabled = !liveCfg.AutoContinueSet || liveCfg.AutoContinue
 			defer cont.Close()
 			stats := newChatStatsReaderSince(cont, st.start)
 			// gateway_hint（SSE）：成功状态 200 已开流，中途 error 帧透传时附加
@@ -1596,8 +1602,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 并非把流改成错误：模型「判断不需要工具、直接回答」是合法行为，强行改写成
 			// 错误会让这类正常回合反复重试、每次都真实计费。
 			if len(declaredTools) > 0 && !stats.SawToolCalls() && stats.FinishReason() == "stop" {
-				log.Printf("WARN: [server] stream acct=%s model=%s: finish_reason=stop with zero tool_calls despite %d declared tool(s) (silent stop; client may treat the turn as complete)",
-					logfmt.Label(acct.UID, acct.Nickname), bareModel, len(declaredTools))
+				log.Printf("WARN: [server] stream acct=%s model=%s: finish_reason=stop with zero tool_calls despite %d declared tool(s) (text_len=%d)",
+					logfmt.Label(acct.UID, acct.Nickname), bareModel, len(declaredTools), stats.TextBytes())
 			}
 			st.ttfb = stats.TTFB()
 			// usage 缺失时保留 chatStat.toks 的 -1 哨兵（观测缺失 → 显示 "-"），

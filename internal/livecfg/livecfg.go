@@ -16,12 +16,16 @@ import (
 
 // Snapshot 一次读取的不可变配置视图。
 type Snapshot struct {
-	APIKey               string              // 网关/面板共同鉴权密钥；空 = 不鉴权
-	SoftCooldown         time.Duration       // 429/限流软冷却基数（<=0 时调用方回退内置默认）
-	SanitizeFingerprints bool                // 出站请求体指纹脱敏
-	RecordClientInfo     bool                // 请求日志是否记录调用来源（客户端 IP / UA）
-	HiddenModels         map[string]struct{} // 精确隐藏的模型 id（已归一化为 "cn:x"/"global:x" 全量形式）；nil = 不隐藏
-	ModelAliases         map[string]string   // 客户端名 → 真实模型名（键已归一化小写；"cn:x"/"global:x" 前缀键只在该域生效，裸名键两域都生效）；nil = 不映射。issue #30
+	APIKey               string        // 网关/面板共同鉴权密钥；空 = 不鉴权
+	SoftCooldown         time.Duration // 429/限流软冷却基数（<=0 时调用方回退内置默认）
+	SanitizeFingerprints bool          // 出站请求体指纹脱敏
+	RecordClientInfo     bool          // 请求日志是否记录调用来源（客户端 IP / UA）
+	// AutoContinue 上游截断后是否自动续写。AutoContinueSet 区分「明确关闭」与
+	// 「旧快照没有这个字段」；未显式设置时保持缺省开启。
+	AutoContinue    bool
+	AutoContinueSet bool
+	HiddenModels    map[string]struct{} // 精确隐藏的模型 id（已归一化为 "cn:x"/"global:x" 全量形式）；nil = 不隐藏
+	ModelAliases    map[string]string   // 客户端名 → 真实模型名（键已归一化小写；"cn:x"/"global:x" 前缀键只在该域生效，裸名键两域都生效）；nil = 不映射。issue #30
 }
 
 // NormalizeModelAliases 把用户配置的 aliases 条目（"客户端名=真实模型名"）归一化为查找表。

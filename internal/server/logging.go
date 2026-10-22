@@ -167,7 +167,9 @@ type chatStatsReader struct {
 	// 两者组合用于识别「声明了 tools 却拿到 stop + 零 tool_calls」的静默回合。
 	sawToolCalls bool
 	finishReason string
-	pend         []byte // 已读未返回的行缓存
+	// textBytes 仅用于静默停转诊断：累计正文字节数，不保存正文内容。
+	textBytes int
+	pend      []byte // 已读未返回的行缓存
 }
 
 // newChatStatsReaderSince 以 since 为 TTFB 计时起点（通常是请求进入 handler 的时刻）。
@@ -190,6 +192,9 @@ func (s *chatStatsReader) SawToolCalls() bool { return s.sawToolCalls }
 
 // FinishReason 本流最后一个非空 finish_reason；上游没给过则为空串。
 func (s *chatStatsReader) FinishReason() string { return s.finishReason }
+
+// TextBytes 返回本流累计正文字节数（只计数，不留内容）。
+func (s *chatStatsReader) TextBytes() int { return s.textBytes }
 
 // Credit 返回末帧 usage.credit（本次真实扣费积分）与是否缺失。
 func (s *chatStatsReader) Credit() (float64, bool) { return s.credit, s.hasCredit }
@@ -254,6 +259,7 @@ func (s *chatStatsReader) parseSSELine(line string) {
 		Choices []struct {
 			Delta struct {
 				ToolCalls []json.RawMessage `json:"tool_calls"`
+				Content   string            `json:"content"`
 			} `json:"delta"`
 			FinishReason string `json:"finish_reason"`
 		} `json:"choices"`
@@ -279,6 +285,7 @@ func (s *chatStatsReader) parseSSELine(line string) {
 		s.errorFrame = true
 	}
 	for _, c := range chunk.Choices {
+		s.textBytes += len(c.Delta.Content)
 		// 上游每帧都带 "tool_calls":[]（空数组），所以判据是长度而不是字段存在。
 		if len(c.Delta.ToolCalls) > 0 {
 			s.sawToolCalls = true

@@ -10,6 +10,10 @@ WorkBuddy2API Panel 是一个自托管的 OpenAI 兼容反向代理网关，将�
 > [!WARNING]
 > 本项目是非官方网关，仅供账号持有人在本机或私有环境使用。不得搭建对外中转站、售卖额度、共享凭据或用于违反上游服务条款的用途。账号风控、封禁和条款风险由使用者自行承担。
 
+> 网关保留截断自动续写。续写段若从头重述已发正文，会裁掉完整重复前缀，只转发新增内容；模型在新内容中的正常重复不受影响。
+>
+> 自动续写可通过 `upstream.auto_continue` 或面板「截断后自动续写」开关关闭；关闭后 `length` 截断直接交给客户端，不发起第二次上游请求。
+
 ## 核心能力
 
 - 入站兼容 `chat_completions`、`codex_responses` 和 `anthropic_messages`
@@ -121,7 +125,7 @@ Linux / macOS 可使用：
 - 网关不保存 `previous_response_id` 或 `store`。
 - `finish_reason=length` 映射为 `response.incomplete`，不会伪装成正常完成。
 - 上游工具调用全部缺少函数名时，流式返回 `response.failed`，错误码为 `upstream_tool_call_dropped`；非流式返回 HTTP 422。
-- 客户端声明了工具，但上游以 normal `stop` 结束且整个回合没有任何工具调用时，流式返回 `response.failed`，错误码为 `upstream_silent_tool_stop`；`tool_choice: "none"` 与 `finish_reason=length` 不受此判据影响。
+- 客户端声明了工具，但上游以 normal `stop` 结束、整个回合没有任何工具调用，且文本以冒号收尾（典型“准备执行”宣告句）时，流式返回 `response.failed`，错误码为 `upstream_silent_tool_stop`。普通最终回答、`tool_choice: "none"`、合法工具调用和 `finish_reason=length` 保持原有语义。
 - 只要本回合仍有合法工具调用，正常完成语义不变。
 - 上游省略工具 `index` 时，只有新的非空 `call_id` 才开启新调用；普通续帧归入最近调用。
 

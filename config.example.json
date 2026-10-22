@@ -59,6 +59,7 @@
     "chat_base": ""
   },
   "upstream": {
+    "auto_continue": true,
     "timeout_seconds": 120,
     "header_timeout_seconds": 120,
     "idle_timeout_seconds": 300,

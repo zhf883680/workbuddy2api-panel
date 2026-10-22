@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
 
@@ -109,6 +110,87 @@ func TestContinueReaderTextCutContinues(t *testing.T) {
 	}
 	if !strings.Contains(req, `"role":"assistant"`) {
 		t.Fatalf("续写请求缺 assistant 消息:\n%s", req)
+	}
+}
+
+// TestContinueDisabledStopsAfterFirstSegment 自动续写关闭时只保留首段，
+// length 终态原样交给客户端，不再额外请求上游。
+func TestContinueDisabledStopsAfterFirstSegment(t *testing.T) {
+	up, reqs := fakeContinueUpstream(t, func(int) (int, string) { return 200, testSeg2Text })
+	r := newTestContinueReader(t, up, `{"model":"m","messages":[{"role":"user","content":"hi"}]}`,
+		io.NopCloser(strings.NewReader(testSeg1Text)))
+	r.enabled = false
+	out, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	s := string(out)
+	if len(*reqs) != 0 {
+		t.Fatalf("auto continue disabled: upstream calls=%d want 0", len(*reqs))
+	}
+	if !strings.Contains(s, `"finish_reason":"length"`) || !strings.Contains(s, "你好") {
+		t.Fatalf("first segment and length should pass through: %s", s)
+	}
+}
+
+// TestContinueEnabledFromLiveSnapshot 关闭自动续写时，Handler 必须使用运行期
+// 快照，不应被构造期的静态默认值覆盖；重新打开后下一次请求立即恢复续写。
+func TestContinueEnabledFromLiveSnapshot(t *testing.T) {
+	up, reqs := fakeContinueUpstream(t, func(int) (int, string) { return 200, testSeg2Text })
+	r := newTestContinueReader(t, up, `{"model":"m","messages":[{"role":"user","content":"hi"}]}`,
+		io.NopCloser(strings.NewReader(testSeg1Text)))
+	r.enabled = false
+	if _, err := io.ReadAll(r); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if len(*reqs) != 0 {
+		t.Fatalf("disabled continue still made %d upstream request(s)", len(*reqs))
+	}
+
+	up2, reqs2 := fakeContinueUpstream(t, func(int) (int, string) { return 200, testSeg2Text })
+	r2 := newTestContinueReader(t, up2, `{"model":"m","messages":[{"role":"user","content":"hi"}]}`,
+		io.NopCloser(strings.NewReader(testSeg1Text)))
+	if _, err := io.ReadAll(r2); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if len(*reqs2) != 1 {
+		t.Fatalf("enabled continue calls=%d want 1", len(*reqs2))
+	}
+}
+
+// TestContinueReaderDropsRepeatedPreviousText 模型在续写时有时会重述整段旧正文。
+// 旧正文已经发给客户端，续写段只应补新增部分。
+func TestContinueReaderDropsRepeatedPreviousText(t *testing.T) {
+	const repeated = `data: {"id":"cmpl-2","choices":[{"index":0,"delta":{"content":"你好世界继续"}}]}` + "\n\n" +
+		`data: {"id":"cmpl-2","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}` + "\n\n" +
+		"data: [DONE]\n\n"
+	up, _ := fakeContinueUpstream(t, func(int) (int, string) { return 200, repeated })
+	r := newTestContinueReader(t, up, `{"model":"m","messages":[{"role":"user","content":"hi"}]}`,
+		io.NopCloser(strings.NewReader(testSeg1Text)))
+	out, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if s := string(out); !strings.Contains(s, `"content":"继续"`) || strings.Contains(s, `"content":"你好世界继续"`) {
+		t.Fatalf("续写段应去掉已输出前缀:\n%s", s)
+	}
+}
+
+// TestContinueReaderKeepsRepeatedWordMidContinuation 只裁剪续写开头的完整旧前缀，
+// 一旦续写进入新内容，句中正常重复的词语必须原样保留。
+func TestContinueReaderKeepsRepeatedWordMidContinuation(t *testing.T) {
+	const repeated = `data: {"id":"cmpl-2","choices":[{"index":0,"delta":{"content":"继续 hello hello"}}]}` + "\n\n" +
+		`data: {"id":"cmpl-2","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}` + "\n\n" +
+		"data: [DONE]\n\n"
+	up, _ := fakeContinueUpstream(t, func(int) (int, string) { return 200, repeated })
+	r := newTestContinueReader(t, up, `{"model":"m","messages":[{"role":"user","content":"hi"}]}`,
+		io.NopCloser(strings.NewReader(testSeg1Text)))
+	out, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if s := string(out); !strings.Contains(s, `"content":"继续 hello hello"`) {
+		t.Fatalf("新内容中的重复词被误删:\n%s", s)
 	}
 }
 
@@ -323,7 +405,15 @@ func TestStreamCutMidToolCallMarksTruncated(t *testing.T) {
 		`data: {"id":"c1","object":"chat.completion.chunk","model":"glm-5.2","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"Bash","arguments":"{\"cmd\":"}}]}}]}` + "\n\n"
 	up := newFakeUpstream(t, func(string) (int, string, bool) { return 200, cut, true })
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
-	h := NewHandler(Config{Pool: p, Upstream: up})
+	h := NewHandler(Config{
+		Pool:         p,
+		Upstream:     up,
+		AutoContinue: true,
+		Live: livecfg.New(livecfg.Snapshot{
+			AutoContinue:    true,
+			AutoContinueSet: true,
+		}),
+	})
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
 		strings.NewReader(`{"model":"glm-5.2","stream":true,"messages":[{"role":"user","content":"hi"}]}`)))
@@ -351,7 +441,15 @@ func TestResponsesStreamCutAutoContinued(t *testing.T) {
 		return 200, testSeg2Text
 	})
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
-	h := NewHandler(Config{Pool: p, Upstream: up})
+	h := NewHandler(Config{
+		Pool:         p,
+		Upstream:     up,
+		AutoContinue: true,
+		Live: livecfg.New(livecfg.Snapshot{
+			AutoContinue:    true,
+			AutoContinueSet: true,
+		}),
+	})
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/responses",
 		strings.NewReader(`{"model":"m","stream":true,"input":"hi"}`)))

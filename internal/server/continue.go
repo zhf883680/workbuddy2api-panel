@@ -72,6 +72,11 @@ type continueReader struct {
 	toolSeen bool
 	errSeen  bool
 	id       string
+	// continuePending 仅用于续写段开头：等待足够文本判断模型是否重述旧正文。
+	continuePending  strings.Builder
+	continueCheck    bool
+	continuationBase string
+	enabled          bool
 
 	blindRetried bool // 断流盲重试已用（每请求一次；见 canContinue）
 
@@ -82,7 +87,7 @@ type continueReader struct {
 }
 
 func newContinueReader(ctx context.Context, up *upstream.Client, acct *auth.Auth, body []byte, clientIP string, meta upstream.ChatMeta, rc io.ReadCloser) *continueReader {
-	r := &continueReader{ctx: ctx, up: up, acct: acct, body: body, clientIP: clientIP, meta: meta, cur: rc, lastClientAt: time.Now()}
+	r := &continueReader{ctx: ctx, up: up, acct: acct, body: body, clientIP: clientIP, meta: meta, cur: rc, lastClientAt: time.Now(), enabled: true}
 	r.br = bufio.NewReaderSize(rc, 64*1024)
 	r.limitSet = bodyHasOutputLimit(body)
 	return r
@@ -204,6 +209,19 @@ func (r *continueReader) frame(payload string) {
 				}
 				if s, ok := d["content"].(string); ok && s != "" {
 					r.text.WriteString(s)
+					if r.seg > 0 && r.continueCheck {
+						s = r.trimContinuationPrefix(s)
+						if s == "" {
+							delete(d, "content")
+							rebuilt = true
+						} else if s != d["content"] {
+							d["content"] = s
+							rebuilt = true
+						}
+						if s == "" {
+							deltaNonEmpty = false
+						}
+					}
 					deltaNonEmpty = true
 				}
 				if tcs, ok := d["tool_calls"].([]any); ok && len(tcs) > 0 {
@@ -241,6 +259,46 @@ func (r *continueReader) frame(payload string) {
 		return // 纯 usage 帧（已入账）：不再下发
 	}
 	r.emit(payload)
+}
+
+// trimContinuationPrefix removes a verbatim replay of the previous text at the
+// very start of a continuation segment. The check is only active while the
+// segment still matches that prefix; after the first new character, later
+// repetitions are normal model prose and must be forwarded unchanged.
+func (r *continueReader) trimContinuationPrefix(delta string) string {
+	if !r.continueCheck {
+		return delta
+	}
+	base := []rune(r.continuationBase)
+	seen := []rune(delta)
+	if r.continuePending.Len() == 0 && len(base) == 0 {
+		r.continueCheck = false
+		return delta
+	}
+	pending := []rune(r.continuePending.String())
+	pending = append(pending, seen...)
+	matched := 0
+	for matched < len(base) && matched < len(pending) && base[matched] == pending[matched] {
+		matched++
+	}
+	if matched == len(base) {
+		// Full old prefix repeated: drop it and any text already buffered.
+		r.continueCheck = false
+		r.continuePending.Reset()
+		return string(pending[len(base):])
+	}
+	if matched == len(pending) && len(pending) < len(base) {
+		// Still a potential prefix: buffer until enough bytes arrive.
+		r.continuePending.Reset()
+		r.continuePending.WriteString(string(pending))
+		return ""
+	}
+	// Diverged before completing the old prefix: this is new text. Forward the
+	// buffered text plus this delta unchanged.
+	r.continueCheck = false
+	out := string(pending)
+	r.continuePending.Reset()
+	return out
 }
 
 func (r *continueReader) emit(payload string) {
@@ -289,6 +347,9 @@ func (r *continueReader) endSegment(sawDone bool) {
 				}
 				log.Printf("[continue] seg=%d model=%s text=%dB reason=%dB%s -> 续写",
 					r.seg, bareModelOf(r.body), r.text.Len(), r.reason.Len(), blindNote)
+				r.continuationBase = r.text.String()
+				r.continuePending.Reset()
+				r.continueCheck = r.continuationBase != ""
 				r.finish, r.tail = "", nil
 				return
 			}
@@ -364,6 +425,9 @@ func (r *continueReader) emitTruncationTerminal() {
 // canContinue 续写资格判定（sawDone=false 表示 EOF/读错误收尾——只有显式
 // finish_reason=length 才续，读错误不续，避免把故障流当截断流续错）。
 func (r *continueReader) canContinue(sawDone bool) bool {
+	if !r.enabled {
+		return false
+	}
 	switch {
 	case r.seg >= maxContinueSegments-1:
 		return false

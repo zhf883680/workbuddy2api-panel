@@ -288,6 +288,8 @@ func main() {
 		SoftCooldown:         cfg.SoftRateDur,
 		SanitizeFingerprints: cfg.Features.SanitizeBlacklistFingerprints,
 		RecordClientInfo:     cfg.Logging.RequestClientInfo,
+		AutoContinue:         cfg.Upstream.AutoContinue,
+		AutoContinueSet:      true,
 		HiddenModels:         livecfg.NormalizeHiddenModels(cfg.Models.Hidden),
 		ModelAliases:         livecfg.NormalizeModelAliases(cfg.Models.Aliases),
 	})
@@ -423,6 +425,7 @@ func main() {
 		// 来源记录开关经 livecfg 热生效；此处同时填静态字段，供 Live 为 nil 的
 		// 裸用/测试路径拿到同一缺省值。
 		RecordClientInfo: cfg.Logging.RequestClientInfo,
+		AutoContinue:     cfg.Upstream.AutoContinue,
 		// handler 侧第三道闸（global realm）：false（显式逃生门）时不列 global: 模型名。
 		GlobalEnabled: cfg.Global.Enabled,
 		// 模型黑名单原始条目；运行期以 livecfg 快照为准（热生效），此处供
@@ -698,6 +701,8 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 		SoftCooldown:         newCfg.SoftRateDur,
 		SanitizeFingerprints: newCfg.Features.SanitizeBlacklistFingerprints,
 		RecordClientInfo:     newCfg.Logging.RequestClientInfo,
+		AutoContinue:         newCfg.Upstream.AutoContinue,
+		AutoContinueSet:      true,
 		HiddenModels:         livecfg.NormalizeHiddenModels(newCfg.Models.Hidden),
 		ModelAliases:         livecfg.NormalizeModelAliases(newCfg.Models.Aliases),
 	})

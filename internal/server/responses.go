@@ -1492,11 +1492,20 @@ func (w *responsesWriter) closeOpenItems() error {
 			return errUpstreamToolCallDropped
 		}
 		if w.x.finishReason == "stop" && w.meta != nil &&
-			w.meta.declaredToolCount > 0 && !w.meta.toolsDisabled {
+			w.meta.declaredToolCount > 0 && !w.meta.toolsDisabled &&
+			isSilentToolAnnouncement(w.x.messageText.String()) {
 			return errUpstreamSilentToolStop
 		}
 	}
 	return nil
+}
+
+// isSilentToolAnnouncement 只识别「准备执行但未执行」的典型收尾：文本以中英文
+// 冒号结束。普通最终回答即使携带 tools 声明也应保持 completed；前端无法在流
+// 已发出后撤回文本，因此不把泛化的“没有工具调用”全部改写成失败。
+func isSilentToolAnnouncement(text string) bool {
+	text = strings.TrimSpace(text)
+	return strings.HasSuffix(text, ":") || strings.HasSuffix(text, "：")
 }
 
 func (w *responsesWriter) closeReasoning() error {
@@ -1612,6 +1621,8 @@ func (w *responsesWriter) emitToolCallDropped() error {
 }
 
 func (w *responsesWriter) emitSilentToolStop() error {
+	log.Printf("WARN: [responses] silent tool stop: declared_tools=%d text_bytes=%d announcement_suffix=true finish_reason=%s",
+		w.meta.declaredToolCount, len(w.x.messageText.String()), w.x.finishReason)
 	return w.emitFailed(silentToolStopError(w.meta.declaredToolCount))
 }
 

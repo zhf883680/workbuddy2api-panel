@@ -181,6 +181,9 @@ type Config struct {
 	} `json:"cn"`
 
 	Upstream struct {
+		// AutoContinue 上游 finish_reason=length 且为纯文本时，自动以同账号/同模型
+		// 补发续写请求。缺省 true；false 时直接返回标准截断终态，不再二次请求。
+		AutoContinue bool `json:"auto_continue"`
 		// TimeoutSeconds 短 RPC（refresh/checkin/balance/FetchModels）总时长上限，默认 120。
 		TimeoutSeconds int `json:"timeout_seconds"`
 		// HeaderTimeoutSeconds 聊天 SSE 首字节前（响应头）上限；<=0 回落 TimeoutSeconds。
@@ -411,6 +414,7 @@ func Default() *Config {
 	c.Schedule.TaskSweepEnabled = true
 	c.Schedule.TaskSweepMinutes = 15
 	c.Upstream.TimeoutSeconds = 120
+	c.Upstream.AutoContinue = true
 	// HeaderTimeoutSeconds/IdleTimeoutSeconds 默认 0（未设置态），回落见 normalize()。
 	c.Upstream.HeaderTimeoutSeconds = 0
 	c.Upstream.IdleTimeoutSeconds = 0
