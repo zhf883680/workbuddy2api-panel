@@ -7,6 +7,8 @@ package server
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -14,6 +16,8 @@ import (
 	"strings"
 	"time"
 )
+
+var errUpstreamToolCallDropped = errors.New("upstream tool call dropped")
 
 // responsesWebsocketUnsupported 回应 Codex 的 WS 升级探测（GET /v1/responses）。
 // 426 是客户端**立刻且粘性**回落 HTTPS 的信号：Codex 的 websocket_fallback 用例确认
@@ -725,6 +729,14 @@ func asContentString(v any) string {
 }
 
 func chatCompletionToResponse(obj map[string]any, meta *responsesMeta) map[string]any {
+	resp, _, _ := chatCompletionToResponseChecked(obj, meta)
+	return resp
+}
+
+// chatCompletionToResponseChecked 把非流式 Chat 响应转成 Responses。
+// dropped 是本回合因缺少函数名而丢弃的工具调用数；当本回合本应 completed、
+// 但所有工具调用都被丢弃且没有合法调用留下时返回 errUpstreamToolCallDropped。
+func chatCompletionToResponseChecked(obj map[string]any, meta *responsesMeta) (map[string]any, int, error) {
 	id, _ := obj["id"].(string)
 	model, _ := obj["model"].(string)
 	var created int64
@@ -746,6 +758,8 @@ func chatCompletionToResponse(obj map[string]any, meta *responsesMeta) map[strin
 	}
 	status, details := responsesStatusFromFinish(fr)
 	output := []any{}
+	dropped := 0
+	validTools := 0
 	if msg != nil {
 		if rc, ok := msg["reasoning_content"].(string); ok && rc != "" {
 			output = append(output, map[string]any{
@@ -757,6 +771,14 @@ func chatCompletionToResponse(obj map[string]any, meta *responsesMeta) map[strin
 		}
 		content, _ := msg["content"].(string)
 		tcs, _ := msg["tool_calls"].([]any)
+		// 旧版 Chat 上游把单个调用放在 message.function_call（对象）。它与
+		// tool_calls 的语义相同，只是没有外层数组；归一后与主路径共用丢弃判据，
+		// 避免旧协议成为「无函数名 → completed」的旁路。
+		if len(tcs) == 0 {
+			if legacy, ok := msg["function_call"].(map[string]any); ok {
+				tcs = []any{map[string]any{"function": legacy}}
+			}
+		}
 		if content != "" || len(tcs) == 0 {
 			output = append(output, map[string]any{
 				"id":      "msg_" + id,
@@ -776,6 +798,11 @@ func chatCompletionToResponse(obj map[string]any, meta *responsesMeta) map[strin
 			if fn != nil {
 				name = asString(fn["name"])
 				args = asString(fn["arguments"])
+			}
+			if strings.TrimSpace(name) == "" {
+				dropped++
+				logDroppedToolCall("non-stream", name, asString(tc["id"]), args, fr)
+				continue
 			}
 			callID := asString(tc["id"])
 			var item map[string]any
@@ -809,6 +836,7 @@ func chatCompletionToResponse(obj map[string]any, meta *responsesMeta) map[strin
 			}
 			meta.fixupItem(item)
 			output = append(output, item)
+			validTools++
 		}
 	}
 	out := map[string]any{
@@ -825,7 +853,10 @@ func chatCompletionToResponse(obj map[string]any, meta *responsesMeta) map[strin
 	if u, ok := obj["usage"].(map[string]any); ok && u != nil {
 		out["usage"] = convertUsage(u)
 	}
-	return out
+	if status == "completed" && dropped > 0 && validTools == 0 {
+		return out, dropped, errUpstreamToolCallDropped
+	}
+	return out, dropped, nil
 }
 
 func convertUsage(u map[string]any) map[string]any {
@@ -893,6 +924,9 @@ type streamState struct {
 	toolOrder             []int
 	usage                 map[string]any
 	output                []any
+	droppedTools          int
+	validTools            int
+	finishReason          string
 }
 
 type toolAcc struct {
@@ -901,6 +935,7 @@ type toolAcc struct {
 	args           strings.Builder
 	opened, closed bool
 	custom         bool // 客户端声明为 custom(freeform)：回程发 custom_tool_call 类 item
+	dropped        bool
 }
 
 // toolDeltaEvent 按工具类型选流式增量事件名（custom 是 input 语义而非 arguments）。
@@ -945,8 +980,11 @@ func (w *responsesWriter) finish() {
 	if w.stream {
 		if strings.Contains(w.Header().Get("Content-Type"), "event-stream") || w.hdrSent {
 			if w.x.created && !w.x.completed && !w.x.failed {
-				_ = w.closeOpenItems()
-				_ = w.emitCompleted()
+				if err := w.closeOpenItems(); errors.Is(err, errUpstreamToolCallDropped) {
+					_ = w.emitToolCallDropped()
+				} else {
+					_ = w.emitCompleted()
+				}
 			}
 			return
 		}
@@ -977,7 +1015,13 @@ func (w *responsesWriter) flushJSON() {
 		_, _ = w.ResponseWriter.Write(w.body)
 		return
 	}
-	raw, err := json.Marshal(chatCompletionToResponse(obj, w.meta))
+	resp, dropped, err := chatCompletionToResponseChecked(obj, w.meta)
+	if errors.Is(err, errUpstreamToolCallDropped) {
+		w.ResponseWriter.WriteHeader(http.StatusUnprocessableEntity)
+		_, _ = w.ResponseWriter.Write(toolCallDroppedErrorJSON(dropped))
+		return
+	}
+	raw, err := json.Marshal(resp)
 	if err != nil {
 		w.ResponseWriter.WriteHeader(status)
 		_, _ = w.ResponseWriter.Write(w.body)
@@ -999,7 +1043,9 @@ func (w *responsesWriter) handleFrame(frame string) error {
 	}
 	if strings.HasPrefix(frame, "data: [DONE]") {
 		w.x.sawDone = true
-		_ = w.closeOpenItems()
+		if err := w.closeOpenItems(); errors.Is(err, errUpstreamToolCallDropped) {
+			return w.emitToolCallDropped()
+		}
 		return w.emitCompleted()
 	}
 	payload, ok := strings.CutPrefix(frame, "data: ")
@@ -1090,7 +1136,10 @@ func (w *responsesWriter) handleChunk(obj map[string]any) error {
 	if fr, ok := c["finish_reason"].(string); ok && fr != "" {
 		w.x.sawFinish = true
 		w.applyFinishReason(fr)
-		return w.closeOpenItems()
+		if err := w.closeOpenItems(); errors.Is(err, errUpstreamToolCallDropped) {
+			return w.emitToolCallDropped()
+		}
+		return nil
 	}
 	return nil
 }
@@ -1099,6 +1148,7 @@ func (w *responsesWriter) handleChunk(obj map[string]any) error {
 // max_output_tokens / content_filter 都不允许伪装成 completed，否则客户端
 // （Codex）会把被截断的输出当作完整结果。
 func (w *responsesWriter) applyFinishReason(fr string) {
+	w.x.finishReason = fr
 	status, details := responsesStatusFromFinish(fr)
 	if status != "" {
 		w.x.status = status
@@ -1205,10 +1255,7 @@ func (w *responsesWriter) handleToolDeltas(tcs []any) error {
 		if tc == nil {
 			continue
 		}
-		idx := 0
-		if v, ok := tc["index"].(float64); ok {
-			idx = int(v)
-		}
+		idx := w.toolKey(tc)
 		acc, ok := w.x.tools[idx]
 		if !ok {
 			acc = &toolAcc{idx: idx}
@@ -1221,7 +1268,7 @@ func (w *responsesWriter) handleToolDeltas(tcs []any) error {
 		fn, _ := tc["function"].(map[string]any)
 		args := ""
 		if fn != nil {
-			if n := asString(fn["name"]); n != "" {
+			if n := asString(fn["name"]); n != "" && strings.TrimSpace(n) != "" {
 				acc.name = n
 				acc.custom = w.meta.isCustom(n)
 			}
@@ -1230,7 +1277,7 @@ func (w *responsesWriter) handleToolDeltas(tcs []any) error {
 		if args != "" {
 			acc.args.WriteString(args)
 		}
-		// ponytail: 无名调用不是合法 Responses item——先攒着，等名字到了再宣告，
+		// 无名调用不是合法 Responses item：先攒着，等名字到了再宣告；
 		// 宣告时把已攒参数作为整段 delta 一次性发出（relaykit 同款）。
 		if !acc.opened {
 			if acc.name == "" {
@@ -1261,6 +1308,38 @@ func (w *responsesWriter) handleToolDeltas(tcs []any) error {
 		}
 	}
 	return nil
+}
+
+// toolKey 解析上游 tool_call 的归属槽位。缺 index 时，只有「非空新 call_id」
+// 能确证这是新调用；无 id 的续片、重复 id 都归入最近调用。宁可并行调用坍缩，
+// 也不能把一次调用的续帧炸成多个 Responses item（会让 Codex 提前收尾）。
+func (w *responsesWriter) toolKey(tc map[string]any) int {
+	if v, ok := tc["index"].(float64); ok {
+		return int(v)
+	}
+	last := 0
+	if len(w.x.toolOrder) > 0 {
+		last = w.x.toolOrder[len(w.x.toolOrder)-1]
+	}
+	id := asString(tc["id"])
+	if id == "" {
+		return last
+	}
+	for idx, acc := range w.x.tools {
+		if acc.id == id {
+			return idx
+		}
+	}
+	if len(w.x.toolOrder) == 0 {
+		return 0
+	}
+	next := last + 1
+	for {
+		if _, used := w.x.tools[next]; !used {
+			return next
+		}
+		next++
+	}
 }
 
 func (w *responsesWriter) openTool(acc *toolAcc) error {
@@ -1300,8 +1379,18 @@ func (w *responsesWriter) closeOpenItems() error {
 	}
 	for _, idx := range w.x.toolOrder {
 		acc := w.x.tools[idx]
-		if acc == nil || acc.closed || acc.name == "" {
-			continue // 无名调用不是合法 item，丢弃
+		if acc == nil || acc.closed {
+			continue
+		}
+		if strings.TrimSpace(acc.name) == "" {
+			// 无名调用不是合法 Responses item。记录一次，待所有 item 收尾后
+			// 统一决定：只剩文本就失败，截断则保留 incomplete，有合法调用则完成。
+			if !acc.dropped {
+				acc.dropped = true
+				w.x.droppedTools++
+				logDroppedToolCall("stream", acc.name, acc.id, acc.args.String(), w.x.finishReason)
+			}
+			continue
 		}
 		if !acc.opened {
 			if err := w.openTool(acc); err != nil {
@@ -1367,7 +1456,11 @@ func (w *responsesWriter) closeOpenItems() error {
 			return err
 		}
 		w.x.output = append(w.x.output, item)
+		w.x.validTools++
 		acc.closed = true
+	}
+	if w.x.droppedTools > 0 && w.x.status == "completed" && w.x.validTools == 0 {
+		return errUpstreamToolCallDropped
 	}
 	return nil
 }
@@ -1478,6 +1571,34 @@ func (w *responsesWriter) emitCompleted() error {
 		resp["usage"] = convertUsage(w.x.usage)
 	}
 	return w.emit(typ, map[string]any{"response": resp})
+}
+
+func (w *responsesWriter) emitToolCallDropped() error {
+	return w.emitFailed(toolCallDroppedError(w.x.droppedTools))
+}
+
+func toolCallDroppedError(dropped int) map[string]any {
+	return map[string]any{
+		"code":    "upstream_tool_call_dropped",
+		"message": fmt.Sprintf("Upstream returned %d tool call(s) without a function name, leaving no usable tool call in this turn", dropped),
+		"type":    "upstream_tool_call_dropped",
+	}
+}
+
+func toolCallDroppedErrorJSON(dropped int) []byte {
+	raw, _ := json.Marshal(map[string]any{
+		"error": toolCallDroppedError(dropped),
+	})
+	return raw
+}
+
+// logDroppedToolCall 只记录结构字段：参数可能是用户代码/对话，不落内容。
+func logDroppedToolCall(path, name, callID, args, finishReason string) {
+	if finishReason == "" {
+		finishReason = "<none>"
+	}
+	log.Printf("WARN: [responses] dropped tool call: path=%s call_id_empty=%t function_name_empty=%t args_bytes=%d finish_reason=%s",
+		path, callID == "", strings.TrimSpace(name) == "", len(args), finishReason)
 }
 
 func (w *responsesWriter) emitFailed(errObj any) error {

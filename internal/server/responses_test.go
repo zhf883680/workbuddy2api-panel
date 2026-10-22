@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -235,6 +236,65 @@ func TestChatCompletionToResponse(t *testing.T) {
 	u := got["usage"].(map[string]any)
 	if u["input_tokens"] != 1 || u["output_tokens"] != 2 {
 		t.Fatalf("usage=%v", u)
+	}
+}
+
+// TestChatCompletionToResponseDropsNamelessTool 非流式回合若所有工具调用都因缺
+// 函数名被丢弃，不能再返回一个 Codex 会误认为成功的空壳 response。
+func TestChatCompletionToResponseDropsNamelessTool(t *testing.T) {
+	chat := map[string]any{
+		"id":      "chatcmpl-drop",
+		"model":   "m",
+		"created": float64(1),
+		"choices": []any{map[string]any{
+			"index": 0,
+			"message": map[string]any{
+				"role":    "assistant",
+				"content": "let me check",
+				"tool_calls": []any{
+					map[string]any{
+						"id":       "call_bad",
+						"type":     "function",
+						"function": map[string]any{"name": "  ", "arguments": "{}"},
+					},
+				},
+			},
+			"finish_reason": "tool_calls",
+		}},
+	}
+	resp, dropped, err := chatCompletionToResponseChecked(chat, nil)
+	if err == nil {
+		t.Fatalf("want transform error, got response=%#v", resp)
+	}
+	if dropped != 1 {
+		t.Fatalf("dropped=%d want 1", dropped)
+	}
+	if strings.Contains(fmt.Sprint(resp), "function_call") {
+		t.Fatalf("invalid tool call leaked: %#v", resp)
+	}
+}
+
+// TestChatCompletionToResponseDropsNamelessLegacyCall 兼容上游的旧版单对象
+// function_call 也不能在没有函数名时伪装成成功回合。
+func TestChatCompletionToResponseDropsNamelessLegacyCall(t *testing.T) {
+	chat := map[string]any{
+		"id": "chatcmpl-legacy",
+		"choices": []any{map[string]any{
+			"index": 0,
+			"message": map[string]any{
+				"role":          "assistant",
+				"content":       "let me check",
+				"function_call": map[string]any{"name": "", "arguments": "{}"},
+			},
+			"finish_reason": "function_call",
+		}},
+	}
+	resp, dropped, err := chatCompletionToResponseChecked(chat, nil)
+	if err == nil {
+		t.Fatalf("want transform error, got response=%#v", resp)
+	}
+	if dropped != 1 {
+		t.Fatalf("dropped=%d want 1", dropped)
 	}
 }
 
@@ -473,6 +533,51 @@ func TestResponsesEndpointStreamErrorBeforeSSE(t *testing.T) {
 	}
 }
 
+// TestResponsesEndpointNonStreamDropsNamelessTool HTTP 层必须把转换失败暴露给
+// Codex，而不是返回 200 + completed 的空壳。
+func TestResponsesEndpointNonStreamDropsNamelessTool(t *testing.T) {
+	const badTool = "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_bad\",\"function\":{\"arguments\":\"{}\"}}]}}]}\n\n" +
+		"data: {\"id\":\"c1\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n" +
+		"data: [DONE]\n\n"
+	up := newFakeUpstream(t, func(string) (int, string, bool) { return 200, badTool, true })
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/v1/responses", strings.NewReader(`{"model":"m","input":"hi","stream":false}`))
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("code=%d want 422 body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"code":"upstream_tool_call_dropped"`) {
+		t.Fatalf("missing error code: %s", rec.Body.String())
+	}
+}
+
+// TestResponsesEndpointNonStreamTruncatedToolCallStaysIncomplete 网关先聚合上游
+// SSE 时，聚合器会剔除残缺工具参数；终态仍必须是 incomplete，不能被误判成文本
+// 正常结束，也不能报 upstream_tool_call_dropped。
+func TestResponsesEndpointNonStreamTruncatedToolCallStaysIncomplete(t *testing.T) {
+	const truncated = "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_cut\",\"function\":{\"name\":\"Bash\",\"arguments\":\"{\\\"cmd\\\":\"}}]}}]}\n\n" +
+		"data: {\"id\":\"c1\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"length\"}]}\n\n" +
+		"data: [DONE]\n\n"
+	up := newFakeUpstream(t, func(string) (int, string, bool) { return 200, truncated, true })
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/v1/responses", strings.NewReader(`{"model":"m","input":"hi","stream":false}`))
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d want 200 body=%s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, `"status":"incomplete"`) || !strings.Contains(body, `"reason":"max_output_tokens"`) {
+		t.Fatalf("want incomplete max_output_tokens: %s", body)
+	}
+	if strings.Contains(body, "upstream_tool_call_dropped") {
+		t.Fatalf("truncation must not be reported as malformed tool call: %s", body)
+	}
+}
+
 func sseTypes(body string) []string {
 	var types []string
 	for _, block := range strings.Split(body, "\n\n") {
@@ -591,29 +696,94 @@ func TestResponsesStreamHoldsNamelessTool(t *testing.T) {
 	}
 }
 
-// TestResponsesStreamDropsNamelessTool 全程无名的 tool_calls 视为无效：不宣告、不进 output。
+// TestResponsesStreamDropsNamelessTool 全程无名的 tool_calls 是转换失败，不是正常
+// 完成的回合：Codex 收到 completed + 零工具调用后会无报错静默结束 agent loop。
 func TestResponsesStreamDropsNamelessTool(t *testing.T) {
-	rec := httptest.NewRecorder()
-	rw := &responsesWriter{ResponseWriter: rec, stream: true}
-	rw.Header().Set("Content-Type", "text/event-stream")
-	frames := []string{
-		`data: {"id":"chatcmpl-1","model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{}"}}]}}]}` + "\n\n",
-		`data: {"id":"chatcmpl-1","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}` + "\n\n",
+	body := driveStream(t, nil,
+		`data: {"id":"chatcmpl-1","model":"m","choices":[{"index":0,"delta":{"content":"let me check"}}]}`+"\n\n",
+		`data: {"id":"chatcmpl-1","model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_bad","function":{"arguments":"{}"}}]}}]}`+"\n\n",
+		`data: {"id":"chatcmpl-1","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`+"\n\n",
 		"data: [DONE]\n\n",
-	}
-	for _, f := range frames {
-		if _, err := rw.Write([]byte(f)); err != nil {
-			t.Fatal(err)
-		}
-	}
-	rw.finish()
-	body := rec.Body.String()
+	)
 	if strings.Contains(body, "function_call") {
 		t.Fatalf("无名调用泄漏: %s", body)
 	}
 	types := sseTypes(body)
-	if types[len(types)-1] != "response.completed" {
-		t.Fatalf("types=%v", types)
+	if !containsStr(types, "response.failed") || containsStr(types, "response.completed") {
+		t.Fatalf("types=%v body=%s", types, body)
+	}
+	if !strings.Contains(body, `"code":"upstream_tool_call_dropped"`) {
+		t.Fatalf("missing structured error code: %s", body)
+	}
+	if !strings.Contains(body, `"delta":"let me check"`) {
+		t.Fatalf("already-emitted text must remain visible: %s", body)
+	}
+}
+
+// TestResponsesStreamAllowsValidToolBesideNameless 只要还剩一个合法工具调用，
+// Codex 就会继续，本回合必须保持 completed。
+func TestResponsesStreamAllowsValidToolBesideNameless(t *testing.T) {
+	body := driveStream(t, nil,
+		`data: {"id":"c1","model":"m","choices":[{"index":0,"delta":{"tool_calls":[`+
+			`{"index":0,"id":"call_bad","function":{"arguments":"{}"}},`+
+			`{"index":1,"id":"call_good","function":{"name":"Bash","arguments":"{\"cmd\":\"ls\"}"}}]}}]}`+"\n\n",
+		`data: {"id":"c1","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`+"\n\n",
+		"data: [DONE]\n\n",
+	)
+	types := sseTypes(body)
+	if !containsStr(types, "response.completed") || containsStr(types, "response.failed") {
+		t.Fatalf("types=%v body=%s", types, body)
+	}
+	if !strings.Contains(body, `"name":"Bash"`) || strings.Contains(body, "call_bad") {
+		t.Fatalf("only valid call must survive: %s", body)
+	}
+}
+
+// TestResponsesStreamMissingIndexKeepsContinuationInOneItem 上游省略 index 时，
+// 没有新 call_id 的续帧只能并入最近调用，不能把参数续片炸成第二个工具 item。
+func TestResponsesStreamMissingIndexKeepsContinuationInOneItem(t *testing.T) {
+	body := driveStream(t, nil,
+		`data: {"id":"c1","model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"id":"call_a","function":{"name":"Bash","arguments":"{\"cmd\":"}}]}}]}`+"\n\n",
+		`data: {"id":"c1","model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"function":{"arguments":"\"ls\"}"}}]}}]}`+"\n\n",
+		`data: {"id":"c1","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`+"\n\n",
+		"data: [DONE]\n\n",
+	)
+	if n := strings.Count(body, `"type":"function_call"`); n != 3 {
+		t.Fatalf("function_call item count=%d want 3 (added/done/output), body=%s", n, body)
+	}
+	if !strings.Contains(body, `"arguments":"{\"cmd\":\"ls\"}"`) {
+		t.Fatalf("continuation was not merged: %s", body)
+	}
+}
+
+// TestResponsesStreamMissingIndexNewIDStartsNewItem 省略 index 但带不同非空
+// call_id 可以确证是新调用，必须独立成 item。
+func TestResponsesStreamMissingIndexNewIDStartsNewItem(t *testing.T) {
+	body := driveStream(t, nil,
+		`data: {"id":"c1","model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"id":"call_a","function":{"name":"Bash","arguments":"{}"}}]}}]}`+"\n\n",
+		`data: {"id":"c1","model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"id":"call_b","function":{"name":"Read","arguments":"{}"}}]}}]}`+"\n\n",
+		`data: {"id":"c1","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`+"\n\n",
+		"data: [DONE]\n\n",
+	)
+	if !strings.Contains(body, `"name":"Bash"`) || !strings.Contains(body, `"name":"Read"`) {
+		t.Fatalf("distinct calls not preserved: %s", body)
+	}
+}
+
+// TestResponsesStreamTruncatedNamelessStaysIncomplete 截断导致工具名缺失时，
+// 归因是 incomplete（max_output_tokens），不能报成上游畸形数据。
+func TestResponsesStreamTruncatedNamelessStaysIncomplete(t *testing.T) {
+	body := driveStream(t, nil,
+		`data: {"id":"c1","model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_cut","function":{"arguments":"{\"cmd\":"}}]}}]}`+"\n\n",
+		`data: {"id":"c1","choices":[{"index":0,"delta":{},"finish_reason":"length"}]}`+"\n\n",
+		"data: [DONE]\n\n",
+	)
+	types := sseTypes(body)
+	if !containsStr(types, "response.incomplete") || containsStr(types, "response.failed") || containsStr(types, "response.completed") {
+		t.Fatalf("types=%v body=%s", types, body)
+	}
+	if !strings.Contains(body, `"reason":"max_output_tokens"`) {
+		t.Fatalf("missing incomplete reason: %s", body)
 	}
 }
 
