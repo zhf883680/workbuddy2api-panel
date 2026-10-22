@@ -533,6 +533,76 @@ func TestResponsesEndpointStreamErrorBeforeSSE(t *testing.T) {
 	}
 }
 
+// TestResponsesEndpointStreamSilentToolStopFails Codex 声明了工具，但上游只返回
+// 一段文本并以 normal stop 结束。该回合没有可执行动作，不能伪装成 completed，
+// 否则 Codex 会把 agent loop 当成正常完成并静默停下。
+func TestResponsesEndpointStreamSilentToolStopFails(t *testing.T) {
+	const silentStop = "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"I will inspect the files\"}}]}\n\n" +
+		"data: {\"id\":\"c1\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" +
+		"data: [DONE]\n\n"
+	up := newFakeUpstream(t, func(string) (int, string, bool) { return 200, silentStop, true })
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/v1/responses", strings.NewReader(
+		`{"model":"m","input":"inspect the repo","stream":true,"tools":[{"type":"function","name":"Bash","parameters":{"type":"object"}}]}`))
+	h.ServeHTTP(rec, req)
+	body := rec.Body.String()
+	types := sseTypes(body)
+	if !containsStr(types, "response.failed") || containsStr(types, "response.completed") {
+		t.Fatalf("types=%v body=%s", types, body)
+	}
+	if !strings.Contains(body, `"code":"upstream_silent_tool_stop"`) {
+		t.Fatalf("missing silent-stop error code: %s", body)
+	}
+	if !strings.Contains(body, `"delta":"I will inspect the files"`) {
+		t.Fatalf("already-emitted text must remain visible: %s", body)
+	}
+}
+
+// TestResponsesEndpointStreamSilentStopToolChoiceNoneCompletes 客户端显式禁止
+// 工具调用时，即使请求携带了 tools 声明，文本 stop 仍是合法完成。
+func TestResponsesEndpointStreamSilentStopToolChoiceNoneCompletes(t *testing.T) {
+	const textStop = "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"The answer is 42.\"}}]}\n\n" +
+		"data: {\"id\":\"c1\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" +
+		"data: [DONE]\n\n"
+	up := newFakeUpstream(t, func(string) (int, string, bool) { return 200, textStop, true })
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/v1/responses", strings.NewReader(
+		`{"model":"m","input":"answer directly","stream":true,"tool_choice":"none","tools":[{"type":"function","name":"Bash","parameters":{"type":"object"}}]}`))
+	h.ServeHTTP(rec, req)
+	body := rec.Body.String()
+	types := sseTypes(body)
+	if !containsStr(types, "response.completed") || containsStr(types, "response.failed") {
+		t.Fatalf("types=%v body=%s", types, body)
+	}
+}
+
+// TestResponsesEndpointStreamDeclaredToolsLengthStaysIncomplete 截断不是
+// normal stop；即使声明了工具且零调用，也必须保留 incomplete 语义。
+func TestResponsesEndpointStreamDeclaredToolsLengthStaysIncomplete(t *testing.T) {
+	const lengthStop = "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"I will\"}}]}\n\n" +
+		"data: {\"id\":\"c1\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"length\"}]}\n\n" +
+		"data: [DONE]\n\n"
+	up := newFakeUpstream(t, func(string) (int, string, bool) { return 200, lengthStop, true })
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/v1/responses", strings.NewReader(
+		`{"model":"m","input":"inspect","stream":true,"tools":[{"type":"function","name":"Bash","parameters":{"type":"object"}}]}`))
+	h.ServeHTTP(rec, req)
+	body := rec.Body.String()
+	types := sseTypes(body)
+	if !containsStr(types, "response.incomplete") || containsStr(types, "response.failed") {
+		t.Fatalf("types=%v body=%s", types, body)
+	}
+	if !strings.Contains(body, `"reason":"max_output_tokens"`) {
+		t.Fatalf("missing incomplete reason: %s", body)
+	}
+}
+
 // TestResponsesEndpointNonStreamDropsNamelessTool HTTP 层必须把转换失败暴露给
 // Codex，而不是返回 200 + completed 的空壳。
 func TestResponsesEndpointNonStreamDropsNamelessTool(t *testing.T) {

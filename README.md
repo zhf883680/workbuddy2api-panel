@@ -121,6 +121,7 @@ Linux / macOS 可使用：
 - 网关不保存 `previous_response_id` 或 `store`。
 - `finish_reason=length` 映射为 `response.incomplete`，不会伪装成正常完成。
 - 上游工具调用全部缺少函数名时，流式返回 `response.failed`，错误码为 `upstream_tool_call_dropped`；非流式返回 HTTP 422。
+- 客户端声明了工具，但上游以 normal `stop` 结束且整个回合没有任何工具调用时，流式返回 `response.failed`，错误码为 `upstream_silent_tool_stop`；`tool_choice: "none"` 与 `finish_reason=length` 不受此判据影响。
 - 只要本回合仍有合法工具调用，正常完成语义不变。
 - 上游省略工具 `index` 时，只有新的非空 `call_id` 才开启新调用；普通续帧归入最近调用。
 

@@ -18,6 +18,7 @@ import (
 )
 
 var errUpstreamToolCallDropped = errors.New("upstream tool call dropped")
+var errUpstreamSilentToolStop = errors.New("upstream stopped without a tool call")
 
 // responsesWebsocketUnsupported 回应 Codex 的 WS 升级探测（GET /v1/responses）。
 // 426 是客户端**立刻且粘性**回落 HTTPS 的信号：Codex 的 websocket_fallback 用例确认
@@ -88,6 +89,7 @@ func responsesToChat(src []byte) ([]byte, *responsesMeta, []serverSearchTool, er
 		chatTools, custom, nsMap, alias := convertTools(tools)
 		// 托管 web_search 由网关执行，不进上游 tools（见 splitHostedSearch）。
 		chatTools, srv = splitHostedSearch(chatTools)
+		meta.declaredToolCount = len(chatTools)
 		if len(chatTools) > 0 {
 			out["tools"] = chatTools
 		}
@@ -95,6 +97,7 @@ func responsesToChat(src []byte) ([]byte, *responsesMeta, []serverSearchTool, er
 	}
 	// tool_choice 也要与出站工具名对齐：重名改名过的工具，客户端仍按原名点名。
 	if v, ok := out["tool_choice"]; ok {
+		meta.toolsDisabled = toolChoiceDisablesTools(v)
 		out["tool_choice"] = meta.flatToolChoice(v)
 	}
 	msgs := []any{}
@@ -151,6 +154,11 @@ func splitHostedSearch(tools []any) ([]any, []serverSearchTool) {
 type responsesMeta struct {
 	customTools map[string]bool
 	nsMap       map[string]string
+	// declaredToolCount 是实际发给上游的工具数；托管工具不计入。
+	// Responses 流式收尾用它识别「声明了工具却零调用、normal stop」的静默停转。
+	declaredToolCount int
+	// toolsDisabled 表示客户端显式要求本轮不调用工具；此时 zero tool_calls 是合法结果。
+	toolsDisabled bool
 	// alias 出站扁平名 -> 客户端原名（只对重名改名过的有值）。
 	// namespace 组内（或与顶层）重名时子工具被改成稳定后缀名（read_file_2），回程必须
 	// 还原成客户端声明的原名，否则客户端下一轮按自己声明的名字回传工具结果就匹配不上；
@@ -159,6 +167,16 @@ type responsesMeta struct {
 }
 
 func (m *responsesMeta) isCustom(name string) bool { return m != nil && m.customTools[name] }
+
+func toolChoiceDisablesTools(v any) bool {
+	if strings.TrimSpace(asString(v)) == "none" {
+		return true
+	}
+	if obj, ok := v.(map[string]any); ok {
+		return strings.TrimSpace(asString(obj["type"])) == "none"
+	}
+	return false
+}
 
 // flatName 反向映射：客户端原名 -> 出站扁平名（没改名过就原样返回）。
 // 重名改名过的工具，原名不唯一（顶层 read_file 与 codex_app.read_file 都叫 read_file），
@@ -980,9 +998,13 @@ func (w *responsesWriter) finish() {
 	if w.stream {
 		if strings.Contains(w.Header().Get("Content-Type"), "event-stream") || w.hdrSent {
 			if w.x.created && !w.x.completed && !w.x.failed {
-				if err := w.closeOpenItems(); errors.Is(err, errUpstreamToolCallDropped) {
+				err := w.closeOpenItems()
+				switch {
+				case errors.Is(err, errUpstreamToolCallDropped):
 					_ = w.emitToolCallDropped()
-				} else {
+				case errors.Is(err, errUpstreamSilentToolStop):
+					_ = w.emitSilentToolStop()
+				default:
 					_ = w.emitCompleted()
 				}
 			}
@@ -1043,8 +1065,12 @@ func (w *responsesWriter) handleFrame(frame string) error {
 	}
 	if strings.HasPrefix(frame, "data: [DONE]") {
 		w.x.sawDone = true
-		if err := w.closeOpenItems(); errors.Is(err, errUpstreamToolCallDropped) {
+		err := w.closeOpenItems()
+		if errors.Is(err, errUpstreamToolCallDropped) {
 			return w.emitToolCallDropped()
+		}
+		if errors.Is(err, errUpstreamSilentToolStop) {
+			return w.emitSilentToolStop()
 		}
 		return w.emitCompleted()
 	}
@@ -1138,6 +1164,8 @@ func (w *responsesWriter) handleChunk(obj map[string]any) error {
 		w.applyFinishReason(fr)
 		if err := w.closeOpenItems(); errors.Is(err, errUpstreamToolCallDropped) {
 			return w.emitToolCallDropped()
+		} else if errors.Is(err, errUpstreamSilentToolStop) {
+			return w.emitSilentToolStop()
 		}
 		return nil
 	}
@@ -1459,8 +1487,14 @@ func (w *responsesWriter) closeOpenItems() error {
 		w.x.validTools++
 		acc.closed = true
 	}
-	if w.x.droppedTools > 0 && w.x.status == "completed" && w.x.validTools == 0 {
-		return errUpstreamToolCallDropped
+	if w.x.status == "completed" && w.x.validTools == 0 {
+		if w.x.droppedTools > 0 {
+			return errUpstreamToolCallDropped
+		}
+		if w.x.finishReason == "stop" && w.meta != nil &&
+			w.meta.declaredToolCount > 0 && !w.meta.toolsDisabled {
+			return errUpstreamSilentToolStop
+		}
 	}
 	return nil
 }
@@ -1577,6 +1611,10 @@ func (w *responsesWriter) emitToolCallDropped() error {
 	return w.emitFailed(toolCallDroppedError(w.x.droppedTools))
 }
 
+func (w *responsesWriter) emitSilentToolStop() error {
+	return w.emitFailed(silentToolStopError(w.meta.declaredToolCount))
+}
+
 func toolCallDroppedError(dropped int) map[string]any {
 	return map[string]any{
 		"code":    "upstream_tool_call_dropped",
@@ -1590,6 +1628,17 @@ func toolCallDroppedErrorJSON(dropped int) []byte {
 		"error": toolCallDroppedError(dropped),
 	})
 	return raw
+}
+
+func silentToolStopError(declared int) map[string]any {
+	return map[string]any{
+		"code": "upstream_silent_tool_stop",
+		"message": fmt.Sprintf(
+			"Upstream declared %d tool(s) but returned finish_reason=stop with no usable tool call, leaving no action for the client",
+			declared,
+		),
+		"type": "upstream_silent_tool_stop",
+	}
 }
 
 // logDroppedToolCall 只记录结构字段：参数可能是用户代码/对话，不落内容。
